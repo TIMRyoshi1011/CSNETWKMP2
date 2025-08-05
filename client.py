@@ -171,9 +171,17 @@ def send_dm(to_user: str, message: str):
     print_prompt()
 
 def send_post(message: str):
+    timestamp = int(time.time())
+    ttl = 3600
+    token = f"{USER_ID}|{timestamp+ttl}|broadcast"
+    msg_id = hex(random.getrandbits(64))[2:]
+    
     msg = (
         f"TYPE: POST\n"
         f"FROM: {USER_ID}@{get_my_ip()}\n"
+        f"MESSAGE_ID: {msg_id}\n"
+        f"TOKEN: {token}\n"
+        f"TTL: {ttl}\n"
         f"MESSAGE: {message}"
     )
     send_udp(msg)
@@ -283,7 +291,8 @@ def main():
                 cmd = buffer.strip()
                 buffer = ""
                 if cmd:
-                    parts = cmd.split(" ", 2)
+                    parts = cmd.split(" ", 1) #changed to splut 1x only
+                    
                     c = parts[0].lower()
                     if c == "exit":
                         break
