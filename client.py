@@ -33,7 +33,8 @@ server_addr = (SERVER_IP, UDP_PORT)
 peers = {}  # user_id -> display_name
 followers = {}
 following = {}
-STATUS = "Online" # defaut
+groups = {}  # group_id -> list of user_ids (not display names)
+STATUS = "Online" # default
 AVATAR_PATH = None 
 
 def log(msg, level="INFO"):
@@ -110,9 +111,9 @@ def listen_loop():
                 if uid in peers:
                     peers[uid] = name
                 
-                clear_input()
-                print(f"👤 {name} ({uid}) is now: '{status}'")
-                print_prompt()
+                # clear_input()
+                # print(f"👤 {name} ({uid}) is now: '{status}'")
+                # print_prompt()
                 
             elif msg_type == "DM":
                 frm = headers.get("FROM", "").split("@")[0]
@@ -243,7 +244,15 @@ def get_my_ip():
         return ip
     except:
         return "127.0.0.1"
-    
+
+def resolve_user_id(name: str) -> str:
+    """Resolve display name to USER_ID (case-insensitive)"""
+    name = name.strip().lower()
+    for uid, display in peers.items():
+        if display.lower() == name:
+            return uid
+    return None
+
 def follow(name: str):
     name = name.strip().lower()
     match_uid = None
@@ -425,14 +434,70 @@ def main():
                         gameid, pos = parts[1], parts[2]
                         print(f"➡️ Move {pos} in game {gameid}")
                     elif c == "group" and len(parts) > 1:
-                        if parts[1] == "create" and len(parts) > 2:
-                            subparts = parts[2].split(" ", 1)
-                            gid = subparts[0]
-                            mems = subparts[1].split(",") if len(subparts) > 1 else []
-                            print(f"👥 Created group {gid} with {len(mems)} members")
-                        elif parts[1] == "send" and len(parts) > 2:
-                            gid, msg = parts[2].split(" ", 1)
-                            print(f"[togroup {gid}] {msg}")
+                        subcmd = parts[1].split(" ", 1)
+                        subcommand = subcmd[0].lower()
+
+                        if subcommand == "create" and len(subcmd) > 1:
+                            # Parse: group create <id> <mems>
+                            args = subcmd[1].strip().split(" ", 1)
+                            if len(args) < 1:
+                                print("❌ Usage: group create <id> [members]")
+                                continue
+                            gid = args[0]
+                            member_names = args[1].split(",") if len(args) > 1 else []
+                            member_names = [name.strip() for name in member_names if name.strip()]
+
+                            # Resolve display names to user IDs
+                            resolved_members = []
+                            unresolved = []
+                            for name in member_names:
+                                uid = resolve_user_id(name)
+                                if uid:
+                                    resolved_members.append(uid)
+                                else:
+                                    unresolved.append(name)
+
+                            # Store group (even if no members)
+                            groups[gid] = resolved_members
+
+                            clear_input()
+                            print(f"👥 Created group '{gid}' with {len(resolved_members)} members")
+                            if unresolved:
+                                print(f"❌ Could not find: {', '.join(unresolved)}")
+                            print_prompt()
+
+                        elif subcommand == "send" and len(subcmd) > 1:
+                            # Parse: group send <id> <msg>
+                            args = subcmd[1].strip().split(" ", 1)
+                            if len(args) < 2:
+                                print("❌ Usage: group send <id> <message>")
+                                continue
+                            gid, message = args[0], args[1]
+
+                            if gid not in groups:
+                                print(f"❌ Group '{gid}' does not exist.")
+                                continue
+
+                            member_ids = groups[gid]
+                            if not member_ids:
+                                print(f"📭 Group '{gid}' is empty. No messages sent.")
+
+                            # Send DM to each member
+                            sent_count = 0
+                            for uid in member_ids:
+                                if uid == USER_ID:
+                                    continue  # Skip self
+                                if uid in peers:
+                                    send_dm(uid, message)
+                                    sent_count += 1
+                                else:
+                                    log(f"Skipping DM to offline user: {uid}", level="WARN")
+
+                            clear_input()
+                            print(f"📤 Sent message to {sent_count} members of group '{gid}'")
+                            print_prompt()
+                        else:
+                            print("❌ Invalid group command. Use: group create <id> [mems] OR group send <id> <msg>")
                     elif c == "debug":
                         print("🔍 Debug Info:")
                         print(f"Following: {following}")
