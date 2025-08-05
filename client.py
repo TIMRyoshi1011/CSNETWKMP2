@@ -193,7 +193,7 @@ def profile_broadcast_loop():
         for uid, info in peers_status.items():
             name = info.get("name", uid)
             status = info.get("status", "")
-            print(f"  {name} ({uid}): '{status}'")
+            print(f" 👤 {name} ({uid}) is now: '{status}'")
         print_prompt()
         
 def send_dm(to_user: str, message: str):
