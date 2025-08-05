@@ -9,6 +9,8 @@ python client.py --userid bob --name Bob
 python client.py --userid kyle --name Kyle
 wait for a few seconds for them to connect
 
+move game-#### [0-9] XorO otherplayername
+
 AI Disclaimer
 The protocol is primarily designed by the author. AI tools, primarily ChatGPT, are leveraged for the writing of the RFC. AI was leveraged to help formulate message structures and RFC formatting. All AI-generated content was thoroughly reviewed, validated, and adapted to meet the functional and educational goals of the project.
 
