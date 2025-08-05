@@ -35,6 +35,7 @@ peers = {}  # user_id -> display_name
 followers = {}
 following = {}
 groups = {}  # group_id -> list of user_ids (not display names)
+games = {} # gameid -> board list of 9 slots (' ', 'X', 'O')
 STATUS = "Online" # default
 peers_status = {}  # user_id -> {"name": ..., "status": ...}
 AVATAR_PATH = None 
@@ -193,10 +194,23 @@ def listen_loop():
                 print_prompt()
 
             elif msg_type == "TICTACTOE_MOVE":
+                from_user = headers.get("FROM", "").split("@")[0]
                 gameid = headers.get("GAMEID")
-                pos = headers.get("POS")
+                position = headers.get("POSITION")
+                symbol = headers.get("SYMBOL", "?")
+                turn = headers.get("TURN", "?")
                 clear_input()
-                print(f"🎮 Move in {gameid}: position {pos}")
+                print(f"🎮 {from_user} played {symbol} at position {position} (Turn {turn}) in game {gameid}")
+                # Initialize board if new
+                if gameid not in games:
+                    games[gameid] = [' '] * 9
+
+                # Update board
+                pos_int = int(position)
+                games[gameid][pos_int] = symbol
+
+                # Print board
+                print_board(games[gameid])
                 print_prompt()
 
         except socket.timeout:
@@ -403,6 +417,41 @@ def tictactoe_invite(to_user: str):
     clear_input()
     print(f"🎮 Game invite sent to {peers[to_user]} ({to_user})")
     print_prompt()
+
+def tictactoe_move(to_user: str, gameid: str, position: int, symbol: str, turn: int):
+    if to_user not in peers:
+        print(f"❌ User '{to_user}' not found.")
+        return
+    
+    timestamp = int(time.time())
+    message_id = hex(random.getrandbits(32))[2:]
+    token_expiry = timestamp + 3600
+    token = f"{USER_ID}@{get_my_ip()}|{token_expiry}|game"
+
+    msg = (
+        f"TYPE: TICTACTOE_MOVE\n"
+        f"FROM: {USER_ID}@{get_my_ip()}\n"
+        f"TO: {to_user}\n"
+        f"GAMEID: {gameid}\n"
+        f"MESSAGE_ID: {message_id}\n"
+        f"POSITION: {position}\n"
+        f"SYMBOL: {symbol}\n"
+        f"TURN: {turn}\n"
+        f"TOKEN: {token}"
+    )
+    send_udp(msg)
+
+    clear_input()
+    print(f"🎮 You moved at position {position} ({symbol}) in game {gameid}")
+    print_prompt()
+
+def print_board(board):
+    print("\nCurrent Board:")
+    for i in range(0, 9, 3):
+        print(f" {board[i]} | {board[i+1]} | {board[i+2]} ")
+        if i < 6:
+            print("---+---+---")
+    print("")
     
 def show_help():
     print("""
@@ -525,9 +574,32 @@ def main():
                         print(f"❤️ Liked post {parts[1]}")
                     elif c == "game" and len(parts) > 1:
                         tictactoe_invite(parts[1])
-                    elif c == "move" and len(parts) > 2:
-                        gameid, pos = parts[1], parts[2]
-                        print(f"➡️ Move {pos} in game {gameid}")
+                    elif c == "move" and len(parts) > 1:
+                        move_parts = parts[1].split(" ")
+                        if len(move_parts) >= 3:
+                            gameid = move_parts[0]
+                            position = int(move_parts[1])
+                            symbol = move_parts[2].upper()  # X or O
+                            # For turn tracking, you could keep a counter or let user input manually for now
+                            turn = 1  
+                            # Determine opponent ID (simplified: opposite of USER_ID stored during invite)
+                            # For now: ask user to input opponent ID in command: move <gameid> <pos> <symbol> <opponent>
+                            # Example: move game-1234 4 X bob
+                            # Optional improvement: track games in dict
+                            to_user = move_parts[3] if len(move_parts) > 3 else None
+                            if to_user:
+                                tictactoe_move(to_user, gameid, position, symbol, turn)
+                                # Initialize board if new
+                                if gameid not in games:
+                                    games[gameid] = [' '] * 9
+
+                                # Update board
+                                games[gameid][position] = symbol
+
+                                # Show updated board
+                                print_board(games[gameid])
+                            else:
+                                print("❌ Usage: move <gameid> <pos> <symbol> <opponent>")
                     elif c == "group" and len(parts) > 1:
                         subcmd = parts[1].split(" ", 1)
                         subcommand = subcmd[0].lower()

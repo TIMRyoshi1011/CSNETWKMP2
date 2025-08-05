@@ -284,7 +284,16 @@ def handle_message(data: bytes, addr):
                     log(f"📤 TICTACTOE_INVITE sent from {sender_id} to {target}")
                 else:
                     log(f"❌ TICTACTOE_INVITE target {target} not found")
-                        
+
+            elif msg_type == "TICTACTOE_MOVE":
+                target = headers.get("TO")
+                if target in clients:
+                    dest = clients[target]
+                    send_udp(raw, dest["ip"], dest["port"])
+                    log(f"🎮 TicTacToe move forwarded from {sender_id} to {target}")
+                else:
+                    log(f"❌ TicTacToe move target {target} not found")
+              
             else:
                 # Broadcast other message types
                 for uid, info in clients.items():
