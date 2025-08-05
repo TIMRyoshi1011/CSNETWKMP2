@@ -111,9 +111,9 @@ def listen_loop():
                 if uid in peers:
                     peers[uid] = name
                 
-                clear_input()
-                print(f"👤 {name} ({uid}) is now: '{status}'")
-                print_prompt()
+                # clear_input()
+                # print(f"👤 {name} ({uid}) is now: '{status}'")
+                # print_prompt()
                 
             elif msg_type == "DM":
                 frm = headers.get("FROM", "").split("@")[0]
