@@ -19,7 +19,7 @@ from typing import Dict, List, Optional
 # Configuration
 # =============================
 UDP_PORT = 50999
-BROADCAST_INTERVAL = 300       # Faster for testing
+BROADCAST_INTERVAL = 60       # Faster for testing
 MAX_RETRIES = 3
 ACK_TIMEOUT = 2
 LOSS_RATE = 0.0  # Set to 0.1–0.3 to test loss
@@ -120,6 +120,13 @@ def validate_token(token: str, required_scope: str) -> bool:
 # Peer Discovery
 # =============================
 def broadcast_profile():
+    """
+    Broadcasts PROFILE message.
+    First two broadcasts every 10 seconds, then every BROADCAST_INTERVAL.
+    """
+    count = 0
+    fast_interval = 10  # seconds
+
     while running:
         msg = (
             f"TYPE: PROFILE\n"
@@ -129,7 +136,14 @@ def broadcast_profile():
         )
         send_udp(msg, '<broadcast>')
         log(f"Broadcasted PROFILE", level="DEBUG")
-        time.sleep(BROADCAST_INTERVAL)
+
+        if count < 3:
+            # Fast broadcast twice
+            time.sleep(fast_interval)
+            count += 1
+        else:
+            # Then go back to normal interval
+            time.sleep(BROADCAST_INTERVAL)
 
 def handle_profile(msg: str, sender_ip: str):
     user_id = extract_field(msg, "USER_ID")
@@ -163,10 +177,10 @@ def handle_ping(msg: str, sender_ip: str, sender_port: int):
 # =============================
 def send_with_retry(msg: str, dest_ip: str, msg_id: str, scope: str):
     token = create_token(scope)
-    if "\n\n" in msg:
-        msg = msg.replace("\n\n", f"TOKEN: {token}\nMSGID: {msg_id}\n\n")
-    else:
-        msg += f"TOKEN: {token}\nMSGID: {msg_id}\n\n"
+    # Ensure message ends with exactly one \n before adding TOKEN/MSGID
+    if not msg.endswith("\n"):
+        msg += "\n"
+    msg += f"TOKEN: {token}\nMSGID: {msg_id}\n\n"  # Double \n\n at end
 
     retries = 0
     while retries < MAX_RETRIES and running:
@@ -192,6 +206,7 @@ def send_with_retry(msg: str, dest_ip: str, msg_id: str, scope: str):
 def send_ack(msgid: str, dest_ip: str):
     ack = f"TYPE: ACK\nMSGID: {msgid}\n\n"
     send_udp(ack, dest_ip)
+    log(f"Sent ACK for {msgid}", level="DEBUG")
 
 # =============================
 # Core Messaging
@@ -203,12 +218,26 @@ def send_post(message: str, image: str = ""):
     msg_id = generate_msgid()
     for peer_id, info in peers.items():
         send_with_retry(msg, info["ip"], msg_id, "chat")
-
+def get_my_ip() -> str:
+    """Get local IP address by connecting to a dummy external address."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 53))  # Doesn't actually send data
+            return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
 def send_dm(to_user: str, message: str):
     if to_user not in peers:
         log(f"User {to_user} not found", level="ERROR")
         return
-    msg = f"TYPE: DM\nTO: {to_user}\nMESSAGE: {message}"
+    # Add FROM field: USER_ID@IP
+    my_ip = get_my_ip()
+    msg = (
+        f"TYPE: DM\n"
+        f"FROM: {USER_ID}@{my_ip}\n"
+        f"TO: {to_user}\n"
+        f"MESSAGE: {message}"
+    )
     msg_id = generate_msgid()
     sent = send_with_retry(msg, peers[to_user]["ip"], msg_id, "dm")
     if sent:
