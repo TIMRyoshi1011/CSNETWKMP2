@@ -100,7 +100,7 @@ def handle_message(data: bytes, addr):
         sender_id_full = headers.get("USER_ID") or headers.get("FROM")
         sender_id = (sender_id_full or "").split("@")[0]
         
-        log(f"🔍 DECODED MESSAGE: {raw}") # DEBUG
+        # log(f"🔍 DECODED MESSAGE: {raw}") # DEBUG
         # if not sender_id and headers.get("FROM"): # for follow (it doesnt hve user_id field)
         #     sender_id = headers.get("FROM").split("@")[0]
             
@@ -110,7 +110,7 @@ def handle_message(data: bytes, addr):
         
         messages_to_send = []
         
-        log(f"2nd DECODED MESSAGE: {raw}") # DEBUG
+        # log(f"2nd DECODED MESSAGE: {raw}") # DEBUG
         
         with lock:
             if msg_type == "REGISTER":
@@ -231,18 +231,29 @@ def handle_message(data: bytes, addr):
                     send_udp(notify, clients[target]["ip"], clients[target]["port"])
                     
             elif msg_type == "PROFILE":
-                log(f"Received PROFILE message from {sender_id}. Updating info...")
+                # log(f"Received PROFILE message from {sender_id}. Updating info...")
                 display_name = headers.get("DISPLAY_NAME")
                 status = headers.get("STATUS")
+                avatar_type = headers.get("AVATAR_TYPE")
+                avatar_encoding = headers.get("AVATAR_ENCODING") 
+                avatar_data = headers.get("AVATAR_DATA")
                 
                 # Update server's client registry with new info
                 if sender_id in clients:
                     clients[sender_id]["name"] = display_name
                     clients[sender_id]["status"] = status
                     clients[sender_id]["last_seen"] = time.time()
-                    log(f"📝 Profile update from {sender_id}: '{status}'")
+                    
+                    # Store avatar info (optional fields)
+                    if avatar_type:
+                        clients[sender_id]["avatar_type"] = avatar_type
+                        clients[sender_id]["avatar_encoding"] = avatar_encoding
+                        clients[sender_id]["avatar_data"] = avatar_data
+                    
+                    avatar_info = f" (with avatar: {avatar_type})" if avatar_type else ""
+                    # log(f"📝 Profile update from {sender_id}: '{status}'{avatar_info}")
 
-                # Broadcast profile 
+                # Broadcast profile to all clients
                 for uid, info in clients.items():
                     send_udp(raw, info["ip"], info["port"])
 

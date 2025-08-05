@@ -13,6 +13,7 @@ import os
 import json
 from datetime import datetime
 from typing import Dict
+import base64
 
 # =============================
 # Configuration
@@ -35,8 +36,12 @@ followers = {}
 following = {}
 groups = {}  # group_id -> list of user_ids (not display names)
 STATUS = "Online" # default
-AVATAR_PATH = None 
 peers_status = {}  # user_id -> {"name": ..., "status": ...}
+AVATAR_PATH = None 
+AVATAR_TYPE = None
+AVATAR_ENCODING = None
+AVATAR_DATA = None
+
 
 def log(msg, level="INFO"):
     print(f"[{level}] {msg}")
@@ -54,10 +59,37 @@ def register_with_server():
         f"TYPE: REGISTER\n"
         f"USER_ID: {USER_ID}\n"
         f"DISPLAY_NAME: {DISPLAY_NAME}"
-        f"STATUS: {STATUS}"
+        # f"STATUS: {STATUS}"
     )
     send_udp(msg)
     log("👤 Registered with server")
+
+# avatar
+def load_avatar(path):
+    
+    try:
+        with open(path, 'rb') as f:
+            data = f.read()
+        if len(data) > 20480:
+            print(f"⚠️ Avatar file too large: {len(data)} bytes (max 20KB)")
+            return None, None, None
+
+        ext = os.path.splitext(path)[1].lower()
+        mime_types = {
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.gif': 'image/gif',
+            '.bmp': 'image/bmp'
+        }
+
+        mime_type = mime_types.get(ext, 'image/jpeg')
+        encoded_data = base64.b64encode(data).decode('ascii').replace('\n', '')
+
+        return mime_type, 'base64', encoded_data
+    except Exception as e:
+        print(f"❌ Error loading avatar: {e}")
+        return None, None, None
 
 def heartbeat():
     while running:
@@ -108,10 +140,16 @@ def listen_loop():
                 uid = uid_with_ip
                 name = headers.get("DISPLAY_NAME", uid)
                 status = headers.get("STATUS", "")
+                avatar_type = headers.get("AVATAR_TYPE")
+                avatar_data = headers.get("AVATAR_DATA")
 
                 peers[uid] = name
-
-                peers_status[uid] = {"name": name, "status": status}
+                peers_status[uid] = {
+                    "name": name, 
+                    "status": status,
+                    "avatar_type": avatar_type,
+                    "avatar_data": avatar_data
+                }
                 
             elif msg_type == "DM":
                 frm = headers.get("FROM", "").split("@")[0]
@@ -175,14 +213,34 @@ def print_prompt():
     sys.stdout.flush()
     
 def send_profile():
-    global STATUS
-    msg = (
-        f"TYPE: PROFILE\n"
-        f"USER_ID: {USER_ID}@{get_my_ip()}\n"
-        f"DISPLAY_NAME: {DISPLAY_NAME}\n"
-        f"STATUS: {STATUS}" 
-    )
+    global STATUS, AVATAR_TYPE, AVATAR_ENCODING, AVATAR_DATA
+    
+    msg_parts = [
+        f"TYPE: PROFILE",
+        f"USER_ID: {USER_ID}@{get_my_ip()}",
+        f"DISPLAY_NAME: {DISPLAY_NAME}",
+        f"STATUS: {STATUS}"
+    ]
+    
+    # Add avatar fields if available
+    if AVATAR_TYPE and AVATAR_ENCODING and AVATAR_DATA:
+        msg_parts.extend([
+            f"AVATAR_TYPE: {AVATAR_TYPE}",
+            f"AVATAR_ENCODING: {AVATAR_ENCODING}",
+            f"AVATAR_DATA: {AVATAR_DATA}"
+        ])
+       
+    msg = "\n".join(msg_parts)
+    # print(f"[DEBUG] Full message length: {len(msg)}")  # Debug line
     send_udp(msg)
+    
+    peers_status[USER_ID] = {
+        "name": DISPLAY_NAME,
+        "status": STATUS,
+        "avatar_type": AVATAR_TYPE,
+        "avatar_data": AVATAR_DATA
+    }
+
 
 def profile_broadcast_loop():
     while running:
@@ -193,7 +251,14 @@ def profile_broadcast_loop():
         for uid, info in peers_status.items():
             name = info.get("name", uid)
             status = info.get("status", "")
-            print(f" 👤 {name} ({uid}) is now: '{status}'")
+            
+            avatar_type = info.get("avatar_type")
+            if avatar_type:  # Remove the .lower() != "none" check
+                avatar_indicator = f" 🖼️({avatar_type})"
+            else:
+                avatar_indicator = ""
+            
+            print(f" 👤 {name} ({uid}) is now: '{status}'{avatar_indicator}")
         print_prompt()
         
 def send_dm(to_user: str, message: str):
@@ -344,6 +409,7 @@ def show_help():
 Commands:
   post <msg>               - Post a message to followers
   status <msg>             - Profile status
+  avatar <path>            - Set avatar image (or 'none' to remove)
   dm <user> <msg>          - Send DM
   follow <user>            - Follow user (server logs)
   unfollow <user>          - Unfollow user
@@ -422,6 +488,29 @@ def main():
                         STATUS = parts[1]
                         send_profile() 
                         print(f"✅ Status updated to: '{STATUS}'")
+                    elif c == "avatar" and len(parts) > 1:
+                        global AVATAR_TYPE, AVATAR_ENCODING, AVATAR_DATA, AVATAR_PATH  # 👈 ENSURE GLOBALS HERE
+                        avatar_path = parts[1].strip()
+                        if avatar_path.lower() == "none":
+                            AVATAR_TYPE = None
+                            AVATAR_ENCODING = None
+                            AVATAR_DATA = None
+                            AVATAR_PATH = None
+                            print("✅ Avatar removed")
+                        else:
+                            mime_type, encoding, data = load_avatar(avatar_path)
+                            if mime_type and encoding and data:
+                                AVATAR_TYPE = mime_type
+                                AVATAR_ENCODING = encoding
+                                AVATAR_DATA = data
+                                AVATAR_PATH = avatar_path
+                                print(f"✅ Avatar loaded: {avatar_path} ({mime_type})")
+                            else:
+                                print("❌ Failed to load avatar")
+                        send_profile()
+
+
+
                     elif c == "dm" and len(parts) > 1: 
                         dm_parts = parts[1].split(" ", 1)
                         if len(dm_parts) >= 2:
