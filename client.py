@@ -36,6 +36,7 @@ following = {}
 groups = {}  # group_id -> list of user_ids (not display names)
 STATUS = "Online" # default
 AVATAR_PATH = None 
+peers_status = {}  # user_id -> {"name": ..., "status": ...}
 
 def log(msg, level="INFO"):
     print(f"[{level}] {msg}")
@@ -103,17 +104,14 @@ def listen_loop():
                     print(f"🎉 {name} joined the chat!")
                     print_prompt()
             elif msg_type == "PROFILE":
-                uid_with_ip = headers.get("USER_ID", "").split("@")
-                uid = uid_with_ip[0]
+                uid_with_ip = headers.get("USER_ID", "").split("@")[0]
+                uid = uid_with_ip
                 name = headers.get("DISPLAY_NAME", uid)
                 status = headers.get("STATUS", "")
-                
-                if uid in peers:
-                    peers[uid] = name
-                
-                # clear_input()
-                # print(f"👤 {name} ({uid}) is now: '{status}'")
-                # print_prompt()
+
+                peers[uid] = name
+
+                peers_status[uid] = {"name": name, "status": status}
                 
             elif msg_type == "DM":
                 frm = headers.get("FROM", "").split("@")[0]
@@ -189,7 +187,14 @@ def send_profile():
 def profile_broadcast_loop():
     while running:
         send_profile()
-        time.sleep(30)
+        time.sleep(300)
+        clear_input()
+        print("\n> 🟢 Status:")
+        for uid, info in peers_status.items():
+            name = info.get("name", uid)
+            status = info.get("status", "")
+            print(f"  {name} ({uid}): '{status}'")
+        print_prompt()
         
 def send_dm(to_user: str, message: str):
     if to_user not in peers:
@@ -372,6 +377,7 @@ def main():
     sock.settimeout(1)
 
     register_with_server()
+    send_profile()  
 
     threading.Thread(target=listen_loop, daemon=True).start()
     threading.Thread(target=heartbeat, daemon=True).start()

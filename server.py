@@ -242,7 +242,7 @@ def handle_message(data: bytes, addr):
                     clients[sender_id]["last_seen"] = time.time()
                     log(f"📝 Profile update from {sender_id}: '{status}'")
 
-                # Broadcast the profile message to all other clients
+                # Broadcast profile 
                 for uid, info in clients.items():
                     send_udp(raw, info["ip"], info["port"])
 
