@@ -338,7 +338,7 @@ def show_help():
     print("""
 Commands:
   post <msg>               - Post a message to followers
-  status                   - Profile status
+  status <msg>             - Profile status
   dm <user> <msg>          - Send DM
   follow <user>            - Follow user (server logs)
   unfollow <user>          - Unfollow user
