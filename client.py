@@ -33,6 +33,8 @@ server_addr = (SERVER_IP, UDP_PORT)
 peers = {}  # user_id -> display_name
 followers = {}
 following = {}
+STATUS = "Online" # defaut
+AVATAR_PATH = None 
 
 def log(msg, level="INFO"):
     print(f"[{level}] {msg}")
@@ -50,6 +52,7 @@ def register_with_server():
         f"TYPE: REGISTER\n"
         f"USER_ID: {USER_ID}\n"
         f"DISPLAY_NAME: {DISPLAY_NAME}"
+        f"STATUS: {STATUS}"
     )
     send_udp(msg)
     log("👤 Registered with server")
@@ -98,7 +101,19 @@ def listen_loop():
                     clear_input()
                     print(f"🎉 {name} joined the chat!")
                     print_prompt()
-
+            elif msg_type == "PROFILE":
+                uid_with_ip = headers.get("USER_ID", "").split("@")
+                uid = uid_with_ip[0]
+                name = headers.get("DISPLAY_NAME", uid)
+                status = headers.get("STATUS", "")
+                
+                if uid in peers:
+                    peers[uid] = name
+                
+                clear_input()
+                print(f"👤 {name} ({uid}) is now: '{status}'")
+                print_prompt()
+                
             elif msg_type == "DM":
                 frm = headers.get("FROM", "").split("@")[0]
                 frm_name = peers.get(frm, frm)
@@ -122,7 +137,16 @@ def listen_loop():
                 clear_input()
                 print(f"👤 {name} followed you!")
                 print_prompt()
-
+                
+            elif msg_type == "UNFOLLOW_NOTIFY":
+                uid = headers.get("USER_ID", "")
+                name = headers.get("DISPLAY_NAME", uid)
+                if uid in followers:
+                    del followers[uid]
+                clear_input()
+                print(f"👤 {name} unfollowed you!")
+                print_prompt()
+                
             elif msg_type == "TICTACTOE_INVITE":
                 gameid = headers.get("GAMEID")
                 player_x = headers.get("PLAYER_X")
@@ -153,7 +177,22 @@ def clear_input():
 def print_prompt():
     sys.stdout.write("> ")
     sys.stdout.flush()
+    
+def send_profile():
+    global STATUS
+    msg = (
+        f"TYPE: PROFILE\n"
+        f"USER_ID: {USER_ID}@{get_my_ip()}\n"
+        f"DISPLAY_NAME: {DISPLAY_NAME}\n"
+        f"STATUS: {STATUS}" 
+    )
+    send_udp(msg)
 
+def profile_broadcast_loop():
+    while running:
+        send_profile()
+        time.sleep(30)
+        
 def send_dm(to_user: str, message: str):
     if to_user not in peers:
         print(f"❌ User '{to_user}' not found.")
@@ -229,13 +268,40 @@ def follow(name: str):
     
     following[match_uid] = peers[match_uid]
     print(f"✅ Following {peers[match_uid]}")
+
+def unfollow(name: str):
+    name = name.strip().lower()
+    match_uid = None
+    for uid, display in peers.items():
+        if display.lower() == name:
+            match_uid = uid
+            break
+
+    if not match_uid:
+        print(f"❌ No peer found with display name '{name}'")
+        return
+    if match_uid not in following:
+        print(f"❌ Not currently following {peers[match_uid]}")
+        return
+
+    msg = (
+        f"TYPE: UNFOLLOW\n"
+        f"FROM: {USER_ID}@{get_my_ip()}\n"
+        f"TO: {match_uid}"
+    )
+    send_udp(msg)
+    
+    del following[match_uid]
+    print(f"✅ Unfollowed {peers[match_uid]}")
     
 def show_help():
     print("""
 Commands:
-  post <msg>               - Send public post
+  post <msg>               - Post a message to followers
+  status                   - Profile status
   dm <user> <msg>          - Send DM
   follow <user>            - Follow user (server logs)
+  unfollow <user>          - Unfollow user
   like <postid>            - Like a post (server logs)
   file <user> <path>       - Send file (not implemented yet)
   game <user>              - Invite to TTT (not implemented yet)
@@ -248,7 +314,7 @@ Commands:
 """)
 
 def main():
-    global sock, USER_ID, DISPLAY_NAME, running
+    global sock, USER_ID, DISPLAY_NAME, running, STATUS
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--userid", type=str, default=f"user_{random.randint(1000,9999)}")
@@ -269,6 +335,8 @@ def main():
 
     threading.Thread(target=listen_loop, daemon=True).start()
     threading.Thread(target=heartbeat, daemon=True).start()
+    threading.Thread(target=profile_broadcast_loop, daemon=True).start()
+
 
     time.sleep(1)
     show_help()
@@ -291,7 +359,7 @@ def main():
                 cmd = buffer.strip()
                 buffer = ""
                 if cmd:
-                    parts = cmd.split(" ", 1) #changed to splut 1x only
+                    parts = cmd.split(" ", 1) #changed to splut 2x
                     
                     c = parts[0].lower()
                     if c == "exit":
@@ -304,13 +372,24 @@ def main():
                             print(f"  {uid} ({name})")
                     elif c == "post" and len(parts) > 1:
                         send_post(parts[1])
-                    elif c == "dm" and len(parts) >= 3:
-                        send_dm(parts[1], parts[2])
+                    elif c == "status" and len(parts) > 1:
+                        STATUS = parts[1]
+                        send_profile() 
+                        print(f"✅ Status updated to: '{STATUS}'")
+                    elif c == "dm" and len(parts) > 1: 
+                        dm_parts = parts[1].split(" ", 1)
+                        if len(dm_parts) >= 2:
+                            user = dm_parts[0]
+                            message = dm_parts[1]
+                            send_dm(user, message)
                     elif c == "follow" and len(parts) > 1:
                         follow(parts[1])
+                    elif c == "unfollow" and len(parts) > 1:
+                        unfollow(parts[1])
                     elif c == "like" and len(parts) > 1:
                         print(f"❤️ Liked post {parts[1]}")
                     elif c == "game" and len(parts) > 1:
+                        
                         print("🎮 Game invite sent (demo only)")
                     elif c == "move" and len(parts) > 2:
                         gameid, pos = parts[1], parts[2]

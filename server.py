@@ -73,17 +73,19 @@ def handle_message(data: bytes, addr):
                 headers[k.strip()] = v.strip()
 
         msg_type = headers.get("TYPE")
-        sender_id = headers.get("USER_ID")
-
+        sender_id_full = headers.get("USER_ID") # Get the full USER_ID
+        sender_id = headers.get("USER_ID", "").split("@")[0] #Extract the simple ID
+        messages_to_send = []
+        
+        log(f"🔍 DECODED MESSAGE: {raw}") # DEBUG
         if not sender_id and headers.get("FROM"): # for follow (it doesnt hve user_id field)
             sender_id = headers.get("FROM").split("@")[0]
             
         if not msg_type or not sender_id:
-            return
-
-        if not msg_type or not sender_id:
             log(f"❌ Missing TYPE or SENDER_ID") 
             return
+        
+        log(f"2nd DECODED MESSAGE: {raw}") # DEBUG
         
         with lock:
             if msg_type == "REGISTER":
@@ -91,9 +93,9 @@ def handle_message(data: bytes, addr):
                     "ip": ip,
                     "port": port,
                     "name": headers.get("DISPLAY_NAME", "Anonymous"),
+                    "status": headers.get("STATUS", ""),
                     "last_seen": time.time(),
-                    "follows": [],      
-                    "followers": []   
+                    "follows": [], "followers": []   
                 }
                 log(f"✅ Registered: {sender_id}")
                 # Send welcome + peer list
@@ -119,56 +121,56 @@ def handle_message(data: bytes, addr):
                     clients[sender_id]["last_seen"] = time.time()
                     clients[sender_id]["ip"] = ip
                     clients[sender_id]["port"] = port
-
-            else:
-                # Forward message
-                if msg_type == "DM":
-                    target = headers.get("TO")
-                    if target in clients:
-                        forward_message(headers, target)
-                ##
-                elif msg_type == "POST":
-                    sender = clients.get(sender_id)
-                    if not sender:
+            # Forward message
+            elif msg_type == "DM":
+                target = headers.get("TO")
+                if target in clients:
+                    dest = clients[target]
+                    send_udp(raw, dest["ip"], dest["port"])
+                    log(f"📤 DM forwarded from {sender_id} to {target}")
+                else:
+                    log(f"❌ DM target {target} not found")
+            ##
+            elif msg_type == "POST":
+                sender = clients.get(sender_id)
+                if not sender:
+                    return
+                token = headers.get("TOKEN", "")
+                ttl = int(headers.get("TTL", 3600))
+                message_id = headers.get("MESSAGE_ID")
+                try:
+                    # Validate token
+                    parts = token.split("|")
+                    if len(parts) != 3 or parts[0] != sender_id or parts[2] != "broadcast":
                         return
-                    token = headers.get("TOKEN", "")
-                    ttl = int(headers.get("TTL", 3600))
-                    message_id = headers.get("MESSAGE_ID")
-                    try:
-                        # Validate token
-                        parts = token.split("|")
-                        if len(parts) != 3 or parts[0] != sender_id or parts[2] != "broadcast":
-                            return
-                        timestamp = int(parts[1]) - ttl
-                        if time.time() > timestamp + ttl:
-                            return  # expired token
-                    except:
-                        return
-                    # Broadcast to followers only
-                    for uid, info in clients.items():
-                        if sender_id in info.get("follows", []):
-                            send_udp(raw, info["ip"], info["port"])
-                            
-                elif msg_type == "FOLLOW":
-                    target = headers.get("TO") #error validation on who user wants to follow
-                    log(f"🔍 FOLLOW request: {sender_id} wants to follow {target}")
-                    
-                    if not target or target == sender_id:
-                        return
-                    if target not in clients:
-                        log(f"❌ Target {target} not online")
-                        return
-                    
-                    #store new following
-                    if target not in clients[sender_id]["follows"]:
-                        clients[sender_id]["follows"].append(target)
-                        clients[target]["followers"].append(sender_id)
-                        log(f"✅ {sender_id} now follows {target}")
+                    timestamp = int(parts[1]) - ttl
+                    if time.time() > timestamp + ttl:
+                        return  # expired token
+                except:
+                    return
+                # Broadcast to followers only
+                for uid, info in clients.items():
+                    if sender_id in info.get("follows", []):
+                        send_udp(raw, info["ip"], info["port"])
                         
-                        # Print debug info
-                        log(f"📊 {sender_id} follows: {clients[sender_id]['follows']}")
-                        log(f"📊 {target} has followers: {clients[target]['followers']}")
-    
+            elif msg_type == "FOLLOW":
+                target = headers.get("TO") #error validation on who user wants to follow
+                log(f"🔍 FOLLOW request: {sender_id} wants to follow {target}")
+                
+                if not target or target == sender_id:
+                    return
+                if target not in clients:
+                    log(f"❌ Target {target} not online")
+                    return
+                
+                #store new following
+                if target not in clients[sender_id]["follows"]:
+                    clients[sender_id]["follows"].append(target)
+                    clients[target]["followers"].append(sender_id)
+                    log(f"✅ {sender_id} now follows {target}")
+                    
+                    # log(f"📊 {target} has followers: {clients[target]['followers']}")
+
                     notify = (
                         f"TYPE: FOLLOW_NOTIFY\n"
                         f"USER_ID: {sender_id}\n"
@@ -176,14 +178,58 @@ def handle_message(data: bytes, addr):
                     )
                     log(f"📤 Sending FOLLOW_NOTIFY to {target}") 
                     send_udp(notify, clients[target]["ip"], clients[target]["port"])
+                
+            elif msg_type == "UNFOLLOW":
+                target = headers.get("TO")
+                log(f"🔍 UNFOLLOW request: {sender_id} wants to unfollow {target}")
 
+                if not target or target == sender_id:
+                    return
+                if sender_id not in clients or target not in clients:
+                    log(f"❌ Invalid UNFOLLOW request: Sender {sender_id} or target {target} not online")
+                    return
+                
+                #store the previous state before modification for logging/notification
+                unfollowed_name = clients[target]["name"]
+
+                # check if following first
+                if target in clients[sender_id]["follows"]:
+                    clients[sender_id]["follows"].remove(target)
+                    clients[target]["followers"].remove(sender_id)
+                    log(f"✅ {sender_id} unfollowed {target}")
+
+                    notify = (
+                        f"TYPE: UNFOLLOW_NOTIFY\n"
+                        f"USER_ID: {sender_id}\n"
+                        f"DISPLAY_NAME: {clients[sender_id]['name']}"
+                    )
+                    send_udp(notify, clients[target]["ip"], clients[target]["port"])
                     
-                else:
-                    # Broadcast other message types
-                    for uid, info in clients.items():
-                        if uid != sender_id:
-                            send_udp(raw, info["ip"], info["port"])
+            elif msg_type == "PROFILE":
+                log(f"Received PROFILE message from {sender_id}. Updating info...")
+                display_name = headers.get("DISPLAY_NAME")
+                status = headers.get("STATUS")
+                
+                # Update server's client registry with new info
+                if sender_id in clients:
+                    clients[sender_id]["name"] = display_name
+                    clients[sender_id]["status"] = status
+                    clients[sender_id]["last_seen"] = time.time()
+                    log(f"📝 Profile update from {sender_id}: '{status}'")
 
+                # Broadcast the profile message to all other clients
+                for uid, info in clients.items():
+                    send_udp(raw, info["ip"], info["port"])
+                        
+            else:
+                # Broadcast other message types
+                for uid, info in clients.items():
+                    if uid != sender_id:
+                        send_udp(raw, info["ip"], info["port"])
+                        
+        # Perform all network I/O *after* the lock has been released
+        for msg, dest_ip, dest_port in messages_to_send:
+            send_udp(msg, dest_ip, dest_port)
     except Exception as e:
         log(f"Error handling packet: {e}", level="ERROR")
 
