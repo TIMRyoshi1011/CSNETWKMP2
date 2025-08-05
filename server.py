@@ -56,6 +56,30 @@ def cleanup_loop():
             log(f"Client timed out: {uid}")
         time.sleep(CLEANUP_INTERVAL)
 
+def validate_token(token: str, sender_id: str) -> bool:
+    try:
+        parts = token.split('|')
+        if len(parts) != 3:
+            log(f"Invalid token format: {token}", level="WARNING")
+            return False
+        token_user_id = parts[0]
+        token_expiry = int(parts[1])
+        token_scope = parts[2]
+
+        if token_user_id != sender_id:
+            log(f"Token user ID mismatch: Expected {sender_id}, Got {token_user_id}", level="WARNING")
+            return False
+        if time.time() > token_expiry:
+            log(f"Token expired for {sender_id}", level="WARNING")
+            return False
+        if token_scope != "chat": # Ensure token is for chat
+            log(f"Invalid token scope: {token_scope}", level="WARNING")
+            return False
+        return True
+    except Exception as e:
+        log(f"Error validating token: {e}", level="ERROR")
+        return False
+
 def handle_message(data: bytes, addr):
     ip, port = addr
     # log(f"🔍 RAW MESSAGE RECEIVED from {addr}: {data}")
@@ -75,11 +99,12 @@ def handle_message(data: bytes, addr):
         msg_type = headers.get("TYPE")
         sender_id = headers.get("USER_ID")
 
-        if not sender_id and headers.get("FROM"): # for follow (it doesnt hve user_id field)
-            sender_id = headers.get("FROM").split("@")[0]
-            
-        if not msg_type or not sender_id:
-            return
+        if msg_type in ["DM", "POST"]:
+            from_header = headers.get("FROM", "")
+            if "@" in from_header:
+                sender_id = from_header.split("@")[0]
+            else:
+                sender_id = from_header 
 
         if not msg_type or not sender_id:
             log(f"❌ Missing TYPE or SENDER_ID") 
@@ -121,12 +146,26 @@ def handle_message(data: bytes, addr):
                     clients[sender_id]["port"] = port
 
             else:
-                # Forward message
                 if msg_type == "DM":
-                    target = headers.get("TO")
+                    target = headers.get("TO", "").split("@")[0] # Extract user_id from TO header
+                    token = headers.get("TOKEN")
+
+                    if not target:
+                        log(f"DM missing TO field from {sender_id}", level="WARNING")
+                        return
+
+                    # --- New: Token validation for DM ---
+                    if not token or not validate_token(token, sender_id):
+                        log(f"Unauthorized DM attempt from {sender_id} to {target} (Invalid/Missing Token)", level="WARNING")
+                        return
+                    # ------------------------------------
+
                     if target in clients:
+                        log(f"Forwarding DM from {sender_id} to {target}")
                         forward_message(headers, target)
-                ##
+                    else:
+                        log(f"DM target {target} not found for message from {sender_id}", level="WARNING")
+
                 elif msg_type == "POST":
                     sender = clients.get(sender_id)
                     if not sender:
@@ -188,11 +227,17 @@ def handle_message(data: bytes, addr):
         log(f"Error handling packet: {e}", level="ERROR")
 
 def forward_message(headers: Dict[str, Any], target: str):
-    msg = "\n".join([f"{k}: {v}" for k, v in headers.items()])
+    msg_lines = []
+    for k, v in headers.items():
+        msg_lines.append(f"{k}: {v}")
+    msg = "\n".join(msg_lines)
+
     with lock:
         if target in clients:
             dest = clients[target]
             send_udp(msg, dest["ip"], dest["port"])
+        else:
+            log(f"Attempted to forward message to unknown target {target}", level="WARNING")
 
 def listen_loop():
     global sock
