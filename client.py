@@ -250,26 +250,20 @@ def listen_loop():
                 print_prompt()
 
 
-            elif msg_type == "TICTACTOE_MOVE":
+            elif msg_type == "TICTACTOE_RESULT":
                 from_user = headers.get("FROM", "").split("@")[0]
-
-                # Ignore move echo from myself
-                if from_user == USER_ID:
-                    return
-
                 gameid = headers.get("GAMEID")
-                position = int(headers.get("POSITION"))
+                result = headers.get("RESULT", "DRAW")
                 symbol = headers.get("SYMBOL", "?")
-                turn = headers.get("TURN", "?")
-
-                # Initialize or update board
-                if gameid not in games:
-                    games[gameid] = [' '] * 9
-                games[gameid][position] = symbol
+                winning_line = headers.get("WINNING_LINE", "")
 
                 clear_input()
-                print(f"🎮 {from_user} played {symbol} at position {position} (Turn {turn}) in game {gameid}")
-                print_board(games[gameid])
+                print(f"🎮 Game {gameid} result from {from_user}: {result} ({symbol})")
+                if gameid in games:
+                    print_board(games[gameid])
+                if winning_line:
+                    print(f"Winning line: {winning_line}")
+                print_prompt()
 
             # --- New File Transfer Message Handling ---
             elif msg_type == "FILE_OFFER":
