@@ -3,3 +3,5 @@
 python lsnp.py --userid alice --name Alice --verbose
 //run term 2
 python lsnp.py --userid bob --name Bob --verbose
+
+wait for a few seconds for them to connect
