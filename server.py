@@ -292,6 +292,15 @@ def handle_message(data: bytes, addr):
                 else:
                     log(f"❌ FILE_OFFER target {target} not found")
 
+            elif msg_type == "TICTACTOE_RESULT":
+                target = headers.get("TO")
+                if target in clients:
+                    dest = clients[target]
+                    send_udp(raw, dest["ip"], dest["port"])
+                    log(f"🎮 TicTacToe result forwarded from {sender_id} to {target}")
+                else:
+                    log(f"❌ TicTacToe result target {target} not found")
+
             elif msg_type == "FILE_CHUNK":
                 target = headers.get("TO")
                 if target in clients:

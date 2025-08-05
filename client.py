@@ -38,6 +38,11 @@ followers = {}
 following = {}
 groups = {}  # group_id -> list of user_ids (not display names)
 games = {} # gameid -> board list of 9 slots (' ', 'X', 'O')
+WIN_LINES = [
+    (0, 1, 2), (3, 4, 5), (6, 7, 8),  # Rows
+    (0, 3, 6), (1, 4, 7), (2, 5, 8),  # Columns
+    (0, 4, 8), (2, 4, 6)              # Diagonals
+]
 STATUS = "Online" # default
 peers_status = {}  # user_id -> {"name": ..., "status": ...}
 AVATAR_PATH = None 
@@ -124,6 +129,7 @@ def file_transfer_cleanup_loop():
                 log(f"Cleaned up file transfer context for {file_id}")
 
 def listen_loop():
+    global games
     global peers
     sock.settimeout(1)
     while running:
@@ -221,22 +227,49 @@ def listen_loop():
             elif msg_type == "TICTACTOE_MOVE":
                 from_user = headers.get("FROM", "").split("@")[0]
                 gameid = headers.get("GAMEID")
-                position = headers.get("POSITION")
+                position = int(headers.get("POSITION"))
                 symbol = headers.get("SYMBOL", "?")
                 turn = headers.get("TURN", "?")
-                clear_input()
-                print(f"🎮 {from_user} played {symbol} at position {position} (Turn {turn}) in game {gameid}")
-                # Initialize board if new
+
+                # Initialize or update board
                 if gameid not in games:
                     games[gameid] = [' '] * 9
+                games[gameid][position] = symbol
 
-                # Update board
-                pos_int = int(position)
-                games[gameid][pos_int] = symbol
-
-                # Print board
+                clear_input()
+                print(f"🎮 {from_user} played {symbol} at position {position} (Turn {turn}) in game {gameid}")
                 print_board(games[gameid])
+
+                # Auto-check result after opponent move
+                result, winning_line = check_game_result(games[gameid], symbol)
+                if result:
+                    winning_str = ",".join(str(i) for i in winning_line)
+                    print(f"🎯 Game ended: {result} by {symbol}")
+                    if winning_line:
+                        print(f"Winning line: {winning_str}")
                 print_prompt()
+
+
+            elif msg_type == "TICTACTOE_MOVE":
+                from_user = headers.get("FROM", "").split("@")[0]
+
+                # Ignore move echo from myself
+                if from_user == USER_ID:
+                    return
+
+                gameid = headers.get("GAMEID")
+                position = int(headers.get("POSITION"))
+                symbol = headers.get("SYMBOL", "?")
+                turn = headers.get("TURN", "?")
+
+                # Initialize or update board
+                if gameid not in games:
+                    games[gameid] = [' '] * 9
+                games[gameid][position] = symbol
+
+                clear_input()
+                print(f"🎮 {from_user} played {symbol} at position {position} (Turn {turn}) in game {gameid}")
+                print_board(games[gameid])
 
             # --- New File Transfer Message Handling ---
             elif msg_type == "FILE_OFFER":
@@ -603,6 +636,39 @@ def tictactoe_move(to_user: str, gameid: str, position: int, symbol: str, turn: 
     print(f"🎮 You moved at position {position} ({symbol}) in game {gameid}")
     print_prompt()
 
+def tictactoe_result(to_user: str, gameid: str, result: str, symbol: str, winning_line: str = ""):
+    global games
+
+    if to_user not in peers:
+        print(f"❌ User '{to_user}' not found.")
+        return
+    
+    timestamp = int(time.time())
+    message_id = hex(random.getrandbits(32))[2:]
+    token_expiry = timestamp + 3600
+    token = f"{USER_ID}@{get_my_ip()}|{token_expiry}|game"
+
+    msg = (
+        f"TYPE: TICTACTOE_RESULT\n"
+        f"FROM: {USER_ID}@{get_my_ip()}\n"
+        f"TO: {to_user}\n"
+        f"GAMEID: {gameid}\n"
+        f"MESSAGE_ID: {message_id}\n"
+        f"RESULT: {result}\n"
+        f"SYMBOL: {symbol}\n"
+        f"WINNING_LINE: {winning_line}\n"
+        f"TIMESTAMP: {timestamp}\n"
+        f"TOKEN: {token}"
+    )
+    send_udp(msg)
+
+    # Show final board (if tracked)
+    clear_input()
+    print(f"🎮 Game {gameid} ended - {result} ({symbol})")
+    if gameid in games:
+        print_board(games[gameid])
+    print_prompt()
+
 def print_board(board):
     print("\nCurrent Board:")
     for i in range(0, 9, 3):
@@ -746,6 +812,17 @@ def send_file_received(to_user_id: str, file_id: str, status: str):
         f"TIMESTAMP: {int(time.time())}"
     )
     send_udp(msg)
+
+
+def check_game_result(board, symbol):
+    # Check win
+    for line in WIN_LINES:
+        if all(board[i] == symbol for i in line):
+            return "WIN", line
+    # Check draw
+    if all(cell != ' ' for cell in board):
+        return "DRAW", ()
+    return None, ()
 
 
 def show_help():
@@ -939,6 +1016,21 @@ def main():
 
                                 # Show updated board
                                 print_board(games[gameid])
+                                # Check for win/draw
+
+                                # After updating board
+                                games[gameid][position] = symbol
+                                print_board(games[gameid])
+
+                                # Check for win/draw
+                                result, winning_line = check_game_result(games[gameid], symbol)
+                                if result:
+                                    # Determine opponent
+                                    opponent = to_user  # Provided in command
+                                    winning_str = ",".join(str(i) for i in winning_line)
+                                    tictactoe_result(opponent, gameid, result, symbol, winning_str)
+
+
                             else:
                                 print("❌ Usage: move <gameid> <pos> <symbol> <opponent>")
                     elif c == "group" and len(parts) > 1:
