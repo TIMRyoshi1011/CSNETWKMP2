@@ -17,7 +17,7 @@ from typing import Dict, Any
 SERVER_IP = "127.0.0.1"
 UDP_PORT = 50999
 BUFFER_SIZE = 8192
-HEARTBEAT_TIMEOUT = 10  # seconds
+HEARTBEAT_TIMEOUT = 30  # seconds
 CLEANUP_INTERVAL = 5
 
 # =============================
