@@ -1,646 +1,598 @@
 #!/usr/bin/env python3
 """
-Lightweight Social Networking Protocol (LSNP)
-Implementation with UDP, Discovery, Messaging, File Transfer, and Games
+Decentralized UDP-based Social Network
+Supports: Messaging, File Transfer, Tic-Tac-Toe, Groups, Tokens, and more
+No central server — fully peer-to-peer using UDP broadcast/unicast
 """
 
 import socket
 import threading
 import time
-import json
-import os
-import base64
 import sys
-import argparse
+import base64
+import os
 import random
+import string
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional
 
-# =============================
-# Configuration
-# =============================
+# -------------------------------
+# CONFIGURATION
+# -------------------------------
+PORT = 50999
+BROADCAST_ADDR = '255.255.255.255'
+BUFFER_SIZE = 65536  # Max UDP packet size
+TTL_PING = 300
+TTL_DEFAULT = 3600
 
-UDP_PORT = 50999
-BROADCAST_INTERVAL = 300  # seconds
-MAX_RETRIES = 3
-ACK_TIMEOUT = 2
-LOSS_RATE = 0.2  # 20% packet loss in test mode
-BUFFER_SIZE = 8192
-VERBOSE = False
-TEST_LOSS = False
+# Global state
+user_id: str = ""
+display_name: str = ""
+status: str = "Online"
+avatar_data: Optional[str] = None  # Base64 string
+verbose = False
 
-# =============================
-# Global State
-# =============================
+# Local storage
+profiles: Dict[str, dict] = {}  # USER_ID -> profile
+followers: set = set()
+following: set = set()
+posts: Dict[str, dict] = {}  # MESSAGE_ID -> post
+revocation_list: set = set()  # Set of revoked tokens
+pending_acks: Dict[str, dict] = {}  # MESSAGE_ID -> {msg, dst, retries}
+file_metadata: Dict[str, dict] = {}  # FILEID -> info about file chunks
+groups: Dict[str, dict] = {}  # GROUP_ID -> {name, members}
+games: Dict[str, dict] = {}  # GAMEID -> game state
 
-running = True
-sock = None
-message_queue = []  # Thread-safe via locks
-message_lock = threading.Lock()
+# Setup UDP socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    sock.bind(("", PORT))
+except Exception as e:
+    print(f"[ERROR] Could not bind to port {PORT}: {e}")
+    sys.exit(1)
 
-# Local user config (load from file or args)
-USER_ID = "user_" + str(random.randint(1000, 9999))
-DISPLAY_NAME = "Anonymous"
-AVATAR = "https://example.com/avatar.png"
 
-# Data stores
-peers = {}  # user_id -> {ip, display_name, avatar, last_seen}
-tokens = {}  # token -> {scope, expiry, revoked}
-outbox = {}  # msg_id -> {msg, dest_ip, retries, sent_time, acked}
-games = {}  # game_id -> {player_x, player_o, board, turn, moves, status}
-groups = {}  # group_id -> {name, members}
-received_chunks = {}  # fileid -> {total, chunks: [data], sender}
-log_file = open("peer_log.txt", "a", buffering=1)
+# -------------------------------
+# VERBOSE PRINTING
+# -------------------------------
+def printv(*args):
+    if verbose:
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        print(f"[{timestamp}] {' '.join(map(str, args))}")
 
-# =============================
-# Utilities
-# =============================
 
-def timestamp():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+# -------------------------------
+# MESSAGE PARSING & BUILDING
+# -------------------------------
+def parse_message(raw: str, sender_ip: str) -> Optional[Dict[str, str]]:
+    lines = [line.strip() for line in raw.strip().split('\n') if line.strip()]
+    msg = {}
+    for line in lines:
+        if ': ' not in line:
+            continue
+        key, value = line.split(': ', 1)
+        msg[key.strip()] = value.strip()
 
-def log(msg, level="INFO"):
-    t = timestamp()
-    entry = f"[{t}] {level} | {msg}"
-    print(entry)
-    log_file.write(entry + "\n")
+    if not msg:
+        return None
 
-def is_valid_utf8(s):
+    # Security: Verify sender IP matches FROM or USER_ID
+    identity_field = msg.get('FROM') or msg.get('USER_ID')
+    if identity_field:
+        try:
+            expected_ip = identity_field.split('@')[1]
+            if expected_ip != sender_ip:
+                printv(f"[SECURITY] IP mismatch: {expected_ip} != {sender_ip} — Dropping message")
+                return None
+        except Exception:
+            return None
+
+    return msg
+
+
+def build_message(fields: dict) -> str:
+    lines = [f"{k}: {v}" for k, v in fields.items()]
+    return '\n'.join(lines) + '\n\n'
+
+
+# -------------------------------
+# UDP SEND
+# -------------------------------
+def send_udp(msg: str, ip: str):
     try:
-        s.encode('utf-8').decode('utf-8')
+        sock.sendto(msg.encode('utf-8'), (ip, PORT))
+        printv("SEND >", ip, msg.split('\n')[0])
+    except Exception as e:
+        printv("[SEND FAIL]", e)
+
+
+# -------------------------------
+# RELIABLE SEND WITH RETRY (for DM, FILE_CHUNK, etc.)
+# -------------------------------
+def send_reliable(msg: str, ip: str, msg_id: str):
+    for attempt in range(3):
+        send_udp(msg, ip)
+        pending_acks[msg_id] = {'msg': msg, 'ip': ip, 'retries': attempt}
+        time.sleep(2)
+        if msg_id not in pending_acks:
+            return
+    if msg_id in pending_acks:
+        printv(f"[RETRY] Failed after 3 attempts: {msg_id}")
+        del pending_acks[msg_id]
+
+
+# -------------------------------
+# BROADCAST PROFILE & PING
+# -------------------------------
+def send_ping():
+    while True:
+        msg = build_message({
+            "TYPE": "PING",
+            "USER_ID": user_id
+        })
+        send_udp(msg, BROADCAST_ADDR)
+        time.sleep(TTL_PING)
+
+
+def send_profile():
+    while True:
+        fields = {
+            "TYPE": "PROFILE",
+            "USER_ID": user_id,
+            "DISPLAY_NAME": display_name,
+            "STATUS": status,
+        }
+        if avatar_data:
+            fields.update({
+                "AVATAR_TYPE": "image/png",
+                "AVATAR_ENCODING": "base64",
+                "AVATAR_DATA": avatar_data
+            })
+        msg = build_message(fields)
+        send_udp(msg, BROADCAST_ADDR)
+        time.sleep(TTL_PING)
+
+
+# -------------------------------
+# TOKEN SYSTEM
+# -------------------------------
+def create_token(user_id: str, scope: str, ttl: int = TTL_DEFAULT) -> str:
+    timestamp = int(time.time())
+    return f"{user_id}|{timestamp + ttl}|{scope}"
+
+
+def validate_token(token: str, scope: str) -> bool:
+    if token in revocation_list:
+        return False
+    try:
+        parts = token.split('|')
+        if len(parts) != 3:
+            return False
+        _, expiry_str, tok_scope = parts
+        expiry = int(expiry_str)
+        if time.time() > expiry:
+            return False
+        if tok_scope != scope:
+            return False
         return True
     except:
         return False
 
-def extract_field(msg: str, key: str) -> Optional[str]:
-    for line in msg.splitlines():
-        if line.startswith(f"{key}:"):
-            return line.split(":", 1)[1].strip()
-    return None
 
-def generate_msgid():
-    return f"msg_{int(time.time() * 1000)}_{random.randint(100, 999)}"
-
-def generate_fileid():
-    return f"file_{random.randint(10000, 99999)}"
-
-def send_udp(data: str, ip: str, port: int = UDP_PORT):
-    if TEST_LOSS and random.random() < LOSS_RATE:
-        log(f"[LOSS] Dropped packet to {ip}: {data[:50]}...", level="DEBUG")
+# -------------------------------
+# HANDLE INCOMING MESSAGES
+# -------------------------------
+def parse_and_handle_message(raw: str, sender_ip: str):
+    msg = parse_message(raw, sender_ip)
+    if not msg:
         return
-    try:
-        sock.sendto(data.encode('utf-8'), (ip, port))
-    except Exception as e:
-        log(f"Send failed to {ip}: {e}", level="ERROR")
 
-# =============================
-# Token System
-# =============================
+    msg_type = msg.get("TYPE")
+    printv("RECV <", sender_ip, msg_type or "(unknown)")
 
-def create_token(scope: str, duration: int = 3600):
-    token = f"tkn_{scope}_{random.randint(1000, 9999)}"
-    tokens[token] = {
-        "scope": scope,
-        "expiry": time.time() + duration,
-        "revoked": False
+    # Validate token if required
+    token = msg.get("TOKEN")
+    scope_map = {
+        "POST": "broadcast",
+        "DM": "chat",
+        "FOLLOW": "follow",
+        "UNFOLLOW": "follow",
+        "LIKE": "broadcast",
+        "FILE_OFFER": "file",
+        "FILE_CHUNK": "file",
+        "TICTACTOE_INVITE": "game",
+        "TICTACTOE_MOVE": "game",
+        "GROUP_CREATE": "group",
+        "GROUP_UPDATE": "group",
+        "GROUP_MESSAGE": "group"
     }
-    return token
+    required_scope = scope_map.get(msg_type)
+    if required_scope and token:
+        if not validate_token(token, required_scope):
+            printv(f"[TOKEN] Invalid/revoked/expired token from {sender_ip}")
+            return
 
-def validate_token(token: str, required_scope: str) -> bool:
-    if token not in tokens:
-        return False
-    t = tokens[token]
-    if t["revoked"] or t["expiry"] < time.time():
-        return False
-    return t["scope"] == required_scope
-
-# =============================
-# Peer Discovery (Simulated mDNS)
-# =============================
-
-def broadcast_profile():
-    while running:
-        msg = (
-            f"TYPE: PROFILE\n"
-            f"USER_ID: {USER_ID}\n"
-            f"DISPLAY_NAME: {DISPLAY_NAME}\n"
-            f"AVATAR: {AVATAR}\n\n"
-        )
-        send_udp(msg, '<broadcast>')
-        log(f"Broadcasted PROFILE", level="DEBUG")
-        time.sleep(BROADCAST_INTERVAL)
-
-def handle_profile(msg: str, sender_ip: str):
-    user_id = extract_field(msg, "USER_ID")
-    if not user_id:
-        return
-    display_name = extract_field(msg, "DISPLAY_NAME") or "Unknown"
-    avatar = extract_field(msg, "AVATAR") or ""
-
-    if user_id in peers:
-        # Update if changed
-        if (peers[user_id]["avatar"] != avatar or
-            peers[user_id]["display_name"] != display_name):
-            log(f"Updated peer: {user_id}")
-        peers[user_id]["last_seen"] = time.time()
-        peers[user_id]["ip"] = sender_ip
+    # Route message
+    handlers = {
+        "PING": handle_ping,
+        "PROFILE": handle_profile,
+        "POST": handle_post,
+        "DM": handle_dm,
+        "FOLLOW": handle_follow,
+        "UNFOLLOW": handle_unfollow,
+        "LIKE": handle_like,
+        "REVOKE": handle_revoke,
+        "ACK": handle_ack,
+        "FILE_OFFER": handle_file_offer,
+        "FILE_CHUNK": handle_file_chunk,
+        "FILE_RECEIVED": lambda m: printv("File receipt confirmed"),
+        "TICTACTOE_INVITE": handle_tictactoe_invite,
+        "TICTACTOE_MOVE": handle_tictactoe_move,
+        "TICTACTOE_RESULT": handle_tictactoe_result,
+        "GROUP_CREATE": handle_group_create,
+        "GROUP_UPDATE": handle_group_update,
+        "GROUP_MESSAGE": handle_group_message,
+    }
+    if msg_type in handlers:
+        handlers[msg_type](msg)
     else:
-        peers[user_id] = {
-            "ip": sender_ip,
-            "display_name": display_name,
-            "avatar": avatar,
-            "last_seen": time.time()
+        printv(f"[UNKNOWN] {msg_type}")
+
+
+# -------------------------------
+# MESSAGE HANDLERS
+# -------------------------------
+def handle_ping(msg):
+    # Silent presence update
+    pass
+
+
+def handle_profile(msg):
+    uid = msg['USER_ID']
+    profiles[uid] = {
+        'DISPLAY_NAME': msg.get('DISPLAY_NAME'),
+        'STATUS': msg.get('STATUS'),
+        'AVATAR_DATA': msg.get('AVATAR_DATA'),
+        'AVATAR_TYPE': msg.get('AVATAR_TYPE'),
+        'LAST_SEEN': time.time()
+    }
+
+
+def handle_post(msg):
+    msg_id = msg['MESSAGE_ID']
+    if msg_id not in posts:
+        print(f"[POST] {msg['USER_ID']}: {msg['CONTENT']}")
+        posts[msg_id] = {
+            'user_id': msg['USER_ID'],
+            'content': msg['CONTENT'],
+            'timestamp': time.time()
         }
-        log(f"Discovered peer: {user_id} @ {sender_ip}")
 
-def handle_ping(msg: str, sender_ip: str, sender_port: int):
-    # Reply with PONG
-    pong = f"TYPE: PONG\nUSER_ID: {USER_ID}\n\n"
-    send_udp(pong, sender_ip, sender_port)
 
-# =============================
-# ACK & Retry System
-# =============================
+def handle_dm(msg):
+    frm = msg['FROM']
+    content = msg['CONTENT']
+    print(f"[DM] {frm}: {content}")
+    send_ack(msg['MESSAGE_ID'], frm.split('@')[1])
 
-def send_with_retry(msg: str, dest_ip: str, msg_id: str, scope: str):
-    token = create_token(scope)
-    msg = msg.replace("\n\n", f"TOKEN: {token}\nMSGID: {msg_id}\n\n")
-    retries = 0
-    while retries < MAX_RETRIES and running:
-        send_udp(msg, dest_ip)
-        log(f"Sent {msg_id} to {dest_ip} (retry {retries})", level="DEBUG")
-        start = time.time()
-        while time.time() - start < ACK_TIMEOUT:
-            with message_lock:
-                if msg_id in [m.get("ack_for") for m in message_queue if m.get("type") == "ACK"]:
-                    log(f"ACK received for {msg_id}", level="DEBUG")
-                    return True
-            time.sleep(0.1)
-        retries += 1
-    log(f"Failed to send {msg_id} after {MAX_RETRIES} retries", level="ERROR")
-    return False
 
-def send_ack(msgid: str, dest_ip: str):
-    ack = f"TYPE: ACK\nMSGID: {msgid}\n\n"
-    send_udp(ack, dest_ip)
-    log(f"Sent ACK for {msgid}", level="DEBUG")
+def handle_follow(msg):
+    frm = msg['FROM']
+    action = "followed" if msg['TYPE'] == "FOLLOW" else "unfollowed"
+    print(f"User {frm} has {action} you")
 
-# =============================
-# Core Messaging
-# =============================
 
-def send_post(message: str, image: str = ""):
-    msg = f"TYPE: POST\nMESSAGE: {message}"
-    if image:
-        msg += f"\nIMAGE: {image}"
-    msg += "\n\n"
-    msg_id = generate_msgid()
-    for peer_id, info in peers.items():
-        send_with_retry(msg, info["ip"], msg_id, "chat")
+def handle_unfollow(msg):
+    handle_follow(msg)
 
-def send_dm(to_user: str, message: str):
-    if to_user not in peers:
-        log(f"User {to_user} not found", level="ERROR")
+
+def handle_like(msg):
+    frm = msg['FROM'].split('@')[0]
+    post_ts = msg['POST_TIMESTAMP']
+    print(f"{frm} likes your post [{post_ts}]")
+
+
+def handle_revoke(msg):
+    token = msg['TOKEN']
+    revocation_list.add(token)
+    printv(f"[TOKEN] Revoked: {token}")
+
+
+def handle_ack(msg):
+    msg_id = msg['MESSAGE_ID']
+    if msg_id in pending_acks:
+        del pending_acks[msg_id]
+
+
+def send_ack(msg_id: str, dst_ip: str):
+    msg = build_message({
+        "TYPE": "ACK",
+        "MESSAGE_ID": msg_id,
+        "STATUS": "RECEIVED"
+    })
+    send_udp(msg, dst_ip)
+
+
+# -------------------------------
+# FILE TRANSFER
+# -------------------------------
+def handle_file_offer(msg):
+    file_id = msg['FILEID']
+    filename = msg['FILENAME']
+    frm = msg['FROM']
+    from_ip = frm.split('@')[1]
+
+    print(f"[FILE] {frm} is sending you '{filename}'. Accept? (y/n)")
+    if input("> ").lower() == 'y':
+        total_chunks = int(msg['TOTAL_CHUNKS'])
+        file_metadata[file_id] = {
+            'filename': filename,
+            'chunks': total_chunks,
+            'received': 0,
+            'data': [None] * total_chunks
+        }
+        printv(f"[FILE] Ready to receive {file_id}")
+
+
+def handle_file_chunk(msg):
+    file_id = msg['FILEID']
+    idx = int(msg['CHUNK_INDEX'])
+    data_b64 = msg['DATA']
+    from_ip = msg['FROM'].split('@')[1]
+
+    if file_id not in file_metadata:
+        send_ack(msg['MESSAGE_ID'], from_ip)
         return
-    msg = f"TYPE: DM\nTO: {to_user}\nMESSAGE: {message}\n\n"
-    msg_id = generate_msgid()
-    send_with_retry(msg, peers[to_user]["ip"], msg_id, "dm")
 
-def send_follow(target: str):
-    if target not in peers:
-        log(f"User {target} not found", level="ERROR")
+    meta = file_metadata[file_id]
+    if idx < 0 or idx >= len(meta['data']) or meta['data'][idx] is not None:
+        send_ack(msg['MESSAGE_ID'], from_ip)
         return
-    msg = f"TYPE: FOLLOW\nTARGET_USER: {target}\n\n"
-    msg_id = generate_msgid()
-    send_with_retry(msg, peers[target]["ip"], msg_id, "follow")
 
-def toggle_like(post_id: str):
-    msg = f"TYPE: LIKE\nPOST_ID: {post_id}\n\n"
-    msg_id = generate_msgid()
-    for peer_id, info in peers.items():
-        send_with_retry(msg, info["ip"], msg_id, "like")
-
-# =============================
-# File Transfer
-# =============================
-
-def send_file(to_user: str, filepath: str):
-    if to_user not in peers:
-        log(f"User {to_user} not found", level="ERROR")
-        return
-    filename = os.path.basename(filepath)
-    filesize = os.path.getsize(filepath)
-    fileid = generate_fileid()
-
-    offer = (
-        f"TYPE: FILE_OFFER\n"
-        f"FILENAME: {filename}\n"
-        f"FILESIZE: {filesize}\n"
-        f"FILEID: {fileid}\n"
-        f"TO: {to_user}\n\n"
-    )
-    msg_id = generate_msgid()
-    if send_with_retry(offer, peers[to_user]["ip"], msg_id, "file"):
-        log(f"File offer sent: {filename}")
-        # Start sending chunks after ACK
-        threading.Thread(target=send_file_chunks, args=(filepath, fileid, peers[to_user]["ip"]), daemon=True).start()
-
-def send_file_chunks(filepath: str, fileid: str, dest_ip: str):
-    with open(filepath, "rb") as f:
-        data = f.read()
-    chunks = [data[i:i+1024] for i in range(0, len(data), 1024)]
-    for idx, chunk in enumerate(chunks):
-        b64_data = base64.b64encode(chunk).decode('utf-8')
-        msg = (
-            f"TYPE: FILE_CHUNK\n"
-            f"FILEID: {fileid}\n"
-            f"CHUNK_NUM: {idx+1}\n"
-            f"TOTAL_CHUNKS: {len(chunks)}\n"
-            f"DATA: {b64_data}\n\n"
-        )
-        chunk_id = f"chunk_{fileid}_{idx}"
-        send_with_retry(msg, dest_ip, chunk_id, "file")
-
-def handle_file_chunk(msg: str, sender_ip: str):
-    fileid = extract_field(msg, "FILEID")
-    chunk_num = int(extract_field(msg, "CHUNK_NUM"))
-    total_chunks = int(extract_field(msg, "TOTAL_CHUNKS"))
-    data_b64 = extract_field(msg, "DATA")
     try:
-        data = base64.b64decode(data_b64)
-    except:
-        log("Invalid Base64 in chunk", level="ERROR")
+        chunk_data = base64.b64decode(data_b64)
+        meta['data'][idx] = chunk_data
+        meta['received'] += 1
+        send_ack(msg['MESSAGE_ID'], from_ip)
+
+        if meta['received'] == meta['chunks']:
+            filepath = f"received_{meta['filename']}"
+            with open(filepath, 'wb') as f:
+                for piece in meta['data']:
+                    f.write(piece)
+            print(f"File transfer of '{meta['filename']}' is complete")
+            del file_metadata[file_id]
+    except Exception as e:
+        print(f"[ERROR] Failed to decode file chunk: {e}")
+
+
+# -------------------------------
+# TIC-TAC-TOE
+# -------------------------------
+def draw_board(board):
+    print("\n".join([
+        f" {board[0]} | {board[1]} | {board[2]} ",
+        "---+---+---",
+        f" {board[3]} | {board[4]} | {board[5]} ",
+        "---+---+---",
+        f" {board[6]} | {board[7]} | {board[8]} "
+    ]))
+
+
+def handle_tictactoe_invite(msg):
+    game_id = msg['GAMEID']
+    frm = msg['FROM']
+    symbol = msg['SYMBOL']
+    print(f"[GAME] {frm} is inviting you to play tic-tac-toe! Accept? (y/n)")
+    if input("> ").lower() == 'y':
+        games[game_id] = {'board': [' ']*9, 'turn': 1}
+        # Example: auto-respond with move
+        send_tictactoe_move(game_id, 4, 'O', frm.split('@')[1])
+
+
+def send_tictactoe_move(game_id: str, pos: int, symbol: str, to_ip: str):
+    current_turn = games.get(game_id, {}).get('turn', 1) + 1
+    msg = build_message({
+        "TYPE": "TICTACTOE_MOVE",
+        "FROM": user_id,
+        "TO": f"dummy@{to_ip}",
+        "GAMEID": game_id,
+        "POSITION": str(pos),
+        "SYMBOL": symbol,
+        "TURN": str(current_turn),
+        "TOKEN": create_token(user_id, 'game')
+    })
+    send_reliable(msg, to_ip, ''.join(random.choices(string.hexdigits.lower(), k=16)))
+
+
+def handle_tictactoe_move(msg):
+    game_id = msg['GAMEID']
+    pos = int(msg['POSITION'])
+    symbol = msg['SYMBOL']
+    turn = int(msg['TURN'])
+    from_ip = msg['FROM'].split('@')[1]
+
+    if game_id not in games:
+        games[game_id] = {'board': [' ']*9, 'turn': 0}
+
+    game = games[game_id]
+    if turn != game['turn'] + 1:
+        send_ack(msg['MESSAGE_ID'], from_ip)
         return
 
-    if fileid not in received_chunks:
-        received_chunks[fileid] = {
-            "total": total_chunks,
-            "chunks": [None] * total_chunks,
-            "sender": sender_ip
-        }
+    if 0 <= pos < 9 and game['board'][pos] == ' ':
+        game['board'][pos] = symbol
+        game['turn'] = turn
+        draw_board(game['board'])
+        send_ack(msg['MESSAGE_ID'], from_ip)
+    else:
+        send_ack(msg['MESSAGE_ID'], from_ip)
 
-    if received_chunks[fileid]["chunks"][chunk_num - 1] is None:
-        received_chunks[fileid]["chunks"][chunk_num - 1] = data
-        log(f"Received chunk {chunk_num}/{total_chunks} of {fileid}")
 
-    # Check if complete
-    if all(received_chunks[fileid]["chunks"]):
-        final_data = b''.join(received_chunks[fileid]["chunks"])
-        filename = f"received/received_{fileid}"
-        os.makedirs("received", exist_ok=True)
-        with open(filename, "wb") as f:
-            f.write(final_data)
-        log(f"File saved: {filename}")
-        # Send FILE_RECEIVED
-        confirm = f"TYPE: FILE_RECEIVED\nFILEID: {fileid}\n\n"
-        send_udp(confirm, received_chunks[fileid]["sender"])
-        del received_chunks[fileid]
+def handle_tictactoe_result(msg):
+    game_id = msg['GAMEID']
+    result = msg['RESULT']
+    symbol = msg['SYMBOL']
+    board = games.get(game_id, {}).get('board', [' ']*9)
+    draw_board(board)
+    print(f"🎮 Game over: {result.upper()} by {symbol}")
 
-# =============================
-# Tic Tac Toe
-# =============================
 
-def render_grid(gameid: str):
-    if gameid not in games:
+# -------------------------------
+# GROUPS
+# -------------------------------
+def handle_group_create(msg):
+    gid = msg['GROUP_ID']
+    name = msg['GROUP_NAME']
+    members = msg['MEMBERS'].split(',')
+    groups[gid] = {'name': name, 'members': set(members)}
+    if user_id in members:
+        print(f"You’ve been added to '{name}'")
+
+
+def handle_group_update(msg):
+    gid = msg['GROUP_ID']
+    if gid not in groups:
         return
-    g = games[gameid]
-    board = g["board"]
-    symbols = {None: " ", "X": "X", "O": "O"}
-    print("\n" + "="*20)
-    print(f"🎮 Tic Tac Toe - Game: {gameid}")
-    print(f"X: {g['player_x']} | O: {g['player_o']}")
-    print("   0   1   2 ")
-    for i in range(3):
-        print(f"{i}  {symbols[board[i][0]]} | {symbols[board[i][1]]} | {symbols[board[i][2]]}")
-        if i < 2: print("  -----------")
-    print("="*20 + "\n")
+    add = msg.get('ADD')
+    remove = msg.get('REMOVE')
+    if add:
+        groups[gid]['members'].add(add)
+    if remove:
+        groups[gid]['members'].discard(remove)
+    name = groups[gid]['name']
+    print(f"Group '{name}' member list was updated")
 
-def start_game(invite_to: str):
-    if invite_to not in peers:
-        log(f"User {invite_to} not found", level="ERROR")
+
+def handle_group_message(msg):
+    frm = msg['FROM']
+    gid = msg['GROUP_ID']
+    if gid not in groups or frm not in groups[gid]['members']:
         return
-    gameid = f"game_{random.randint(1000, 9999)}"
-    games[gameid] = {
-        "player_x": USER_ID,
-        "player_o": invite_to,
-        "board": [[None]*3 for _ in range(3)],
-        "turn": 1,
-        "moves": [],
-        "status": "active"
-    }
-    msg = f"TYPE: TICTACTOE_INVITE\nGAMEID: {gameid}\nPLAYER_X: {USER_ID}\nPLAYER_O: {invite_to}\n\n"
-    msg_id = generate_msgid()
-    send_with_retry(msg, peers[invite_to]["ip"], msg_id, "game")
-    log(f"Invited {invite_to} to game {gameid}")
+    content = msg['CONTENT']
+    name = groups[gid]['name']
+    print(f"[GROUP '{name}'] {frm}: {content}")
 
-def make_move(gameid: str, pos: int):
-    if gameid not in games:
-        log("Game not found", level="ERROR")
-        return
-    g = games[gameid]
-    if g["status"] != "active":
-        log("Game over", level="ERROR")
-        return
-    row, col = pos // 3, pos % 3
-    if g["board"][row][col] is not None:
-        log("Invalid move", level="ERROR")
-        return
 
-    symbol = "X" if len(g["moves"]) % 2 == 0 else "O"
-    g["board"][row][col] = symbol
-    g["moves"].append((g["turn"], pos, USER_ID))
-    g["turn"] += 1
-
-    msg = f"TYPE: TICTACTOE_MOVE\nGAMEID: {gameid}\nPOS: {pos}\nTURN: {g['turn']-1}\n\n"
-    # Send to opponent
-    opp = g["player_o"] if USER_ID == g["player_x"] else g["player_x"]
-    if opp in peers:
-        msg_id = generate_msgid()
-        send_with_retry(msg, peers[opp]["ip"], msg_id, "game")
-    render_grid(gameid)
-
-def handle_invite(msg: str, sender_ip: str):
-    gameid = extract_field(msg, "GAMEID")
-    player_x = extract_field(msg, "PLAYER_X")
-    player_o = extract_field(msg, "PLAYER_O")
-    if gameid in games:
-        return  # Already exists
-    games[gameid] = {
-        "player_x": player_x,
-        "player_o": player_o,
-        "board": [[None]*3 for _ in range(3)],
-        "turn": 1,
-        "moves": [],
-        "status": "active"
-    }
-    log(f"Invited to game {gameid} by {player_x}")
-    render_grid(gameid)
-
-def handle_move(msg: str, sender_ip: str):
-    gameid = extract_field(msg, "GAMEID")
-    pos = int(extract_field(msg, "POS"))
-    turn = int(extract_field(msg, "TURN"))
-    if gameid not in games:
-        return
-    g = games[gameid]
-    # Prevent duplicates
-    if turn <= len(g["moves"]):
-        log(f"Duplicate move {turn} in game {gameid}", level="DEBUG")
-        return
-    row, col = pos // 3, pos % 3
-    symbol = "O" if USER_ID == g["player_x"] else "X"
-    g["board"][row][col] = symbol
-    g["moves"].append((turn, pos, "opponent"))
-    g["turn"] = turn + 1
-    render_grid(gameid)
-
-# =============================
-# Group Messaging
-# =============================
-
-def create_group(group_id: str, members: List[str], name: str):
-    valid_members = [m for m in members if m in peers]
-    groups[group_id] = {
-        "name": name,
-        "members": valid_members
-    }
-    msg = (
-        f"TYPE: GROUP_CREATE\n"
-        f"GROUP_ID: {group_id}\n"
-        f"NAME: {name}\n"
-        f"MEMBERS: {','.join(valid_members)}\n\n"
-    )
-    msg_id = generate_msgid()
-    for member in valid_members:
-        if member != USER_ID:
-            send_with_retry(msg, peers[member]["ip"], msg_id + "_" + member, "group")
-
-def send_group_message(group_id: str, message: str):
-    if group_id not in groups:
-        log("Group not found", level="ERROR")
-        return
-    msg = f"TYPE: GROUP_MESSAGE\nGROUP_ID: {group_id}\nMESSAGE: {message}\n\n"
-    msg_id = generate_msgid()
-    for member in groups[group_id]["members"]:
-        if member != USER_ID and member in peers:
-            send_with_retry(msg, peers[member]["ip"], msg_id, "group")
-
-# =============================
-# UDP Listener
-# =============================
-
+# -------------------------------
+# LISTEN LOOP
+# -------------------------------
 def listen_loop():
-    global running
-    while running:
+    printv("[NETWORK] Listening on UDP port", PORT)
+    while True:
         try:
             data, addr = sock.recvfrom(BUFFER_SIZE)
-            ip, port = addr
-            raw_msg = data.decode('utf-8', errors='ignore')
-            if not raw_msg.endswith("\n\n"):
-                log(f"Malformed: no \\n\\n: {raw_msg[:50]}", level="WARN")
-                continue
-            if not is_valid_utf8(raw_msg):
-                log(f"Invalid UTF-8 from {ip}", level="ERROR")
-                continue
-
-            msg_type = extract_field(raw_msg, "TYPE")
-            if not msg_type:
-                log(f"No TYPE in message from {ip}", level="WARN")
-                continue
-
-            # IP validation
-            claimed_from = extract_field(raw_msg, "FROM")
-            if claimed_from:
-                claimed_ip = claimed_from.split("@")[1] if "@" in claimed_from else None
-                if claimed_ip and claimed_ip != ip:
-                    log(f"SECURITY WARNING: IP mismatch. Claimed={claimed_ip}, Actual={ip}", level="WARN")
-                    continue
-
-            # Token validation
-            token = extract_field(raw_msg, "TOKEN")
-            scopes = {
-                "POST": "chat", "DM": "dm", "FOLLOW": "follow", "LIKE": "like",
-                "FILE_OFFER": "file", "FILE_CHUNK": "file", "TICTACTOE_MOVE": "game",
-                "GROUP_MESSAGE": "group"
-            }
-            required_scope = scopes.get(msg_type)
-            if required_scope and token and not validate_token(token, required_scope):
-                log(f"Invalid token in {msg_type} from {ip}", level="WARN")
-                continue
-
-            # Add to queue
-            with message_lock:
-                message_queue.append({
-                    "raw": raw_msg,
-                    "type": msg_type,
-                    "ip": ip,
-                    "port": port,
-                    "time": time.time()
-                })
-
-            # Send ACK if needed
-            msgid = extract_field(raw_msg, "MSGID")
-            if msgid:
-                send_ack(msgid, ip)
-
-        except socket.timeout:
-            continue
+            raw = data.decode('utf-8', errors='replace')
+            sender_ip = addr[0]
+            parse_and_handle_message(raw, sender_ip)
         except Exception as e:
-            log(f"Recv error: {e}", level="ERROR")
+            print(f"[ERROR] Receive failed: {e}")
 
-# =============================
-# Message Processor
-# =============================
 
-def process_messages():
-    while running:
-        with message_lock:
-            if message_queue:
-                msg = message_queue.pop(0)
-            else:
-                msg = None
-        if msg:
-            t = msg["type"]
-            ip = msg["ip"]
-            raw = msg["raw"]
-            log(f"RX {t} from {ip}", level="DEBUG")
-
-            if t == "PROFILE":
-                handle_profile(raw, ip)
-            elif t == "PING":
-                handle_ping(raw, ip, msg["port"])
-            elif t == "PONG":
-                user = extract_field(raw, "USER_ID")
-                if user:
-                    peers.setdefault(user, {})["ip"] = ip
-            elif t == "FILE_CHUNK":
-                handle_file_chunk(raw, ip)
-            elif t == "TICTACTOE_INVITE":
-                handle_invite(raw, ip)
-            elif t == "TICTACTOE_MOVE":
-                handle_move(raw, ip)
-            elif t in ["POST", "DM", "FOLLOW", "LIKE", "GROUP_CREATE", "GROUP_MESSAGE"]:
-                # Just log for now
-                log(f"{t}: {extract_field(raw, 'MESSAGE') or '...'}", level="INFO")
-            elif t == "ACK":
-                msgid = extract_field(raw, "MSGID")
-                with message_lock:
-                    # Mark as received
-                    pass  # We use polling in send_with_retry
-        time.sleep(0.01)
-
-# =============================
-# CLI & Main
-# =============================
-
-def show_help():
-    print("""
-Commands:
-  post <msg>               - Send public post
-  dm <user> <msg>          - Send DM
-  follow <user>            - Follow user
-  like <postid>            - Like a post
-  file <user> <path>       - Send file
-  game <user>              - Invite to TTT
-  move <gameid> <0-8>      - Make TTT move
-  group create <id> <mems> - Create group (comma list)
-  group send <id> <msg>    - Send group message
-  peers                    - List peers
-  help                     - Show this
-  exit                     - Quit
-""")
-
+# -------------------------------
+# MAIN
+# -------------------------------
 def main():
-    global sock, USER_ID, DISPLAY_NAME, VERBOSE, TEST_LOSS, running
+    global user_id, display_name, verbose, avatar_data
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--userid", type=str, default=USER_ID)
-    parser.add_argument("--name", type=str, default="Anonymous")
-    parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--loss", action="store_true")
-    args = parser.parse_args()
+    if '--verbose' in sys.argv:
+        verbose = True
+        sys.argv.remove('--verbose')
 
-    USER_ID = args.userid
-    DISPLAY_NAME = args.name
-    VERBOSE = args.verbose
-    TEST_LOSS = args.loss
+    if len(sys.argv) < 3:
+        print("Usage: p2pnet.py <display_name> <your_ip> [--verbose]")
+        print("Example: p2pnet.py Alice 192.168.1.10 --verbose")
+        sys.exit(1)
 
-    log(f"Starting LSNP node: {USER_ID} ({DISPLAY_NAME})")
+    display_name = sys.argv[1]
+    my_ip = sys.argv[2]
+    user_id = f"{display_name}@{my_ip}"
 
-    # Setup socket
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.bind(("", UDP_PORT))
-        sock.settimeout(1.0)
-    except Exception as e:
-        log(f"Bind failed: {e}", level="ERROR")
-        return
-
-    # Start threads
-    threading.Thread(target=listen_loop, daemon=True).start()
-    threading.Thread(target=process_messages, daemon=True).start()
-    threading.Thread(target=broadcast_profile, daemon=True).start()
-
-    log("System ready. Type 'help' for commands.")
-
-    show_help()
-    try:
-        while True:
-            try:
-                cmd = input("> ").strip()
-                if not cmd:
-                    continue
-                parts = cmd.split(" ", 2)
-                c = parts[0].lower()
-
-                if c == "exit":
-                    break
-                elif c == "help":
-                    show_help()
-                elif c == "post" and len(parts) > 1:
-                    send_post(parts[1])
-                elif c == "dm" and len(parts) > 2:
-                    send_dm(parts[1], parts[2])
-                elif c == "follow" and len(parts) > 1:
-                    send_follow(parts[1])
-                elif c == "like" and len(parts) > 1:
-                    toggle_like(parts[1])
-                elif c == "file" and len(parts) > 2:
-                    send_file(parts[1], parts[2])
-                elif c == "game" and len(parts) > 1:
-                    start_game(parts[1])
-                elif c == "move" and len(parts) > 2:
-                    make_move(parts[1], int(parts[2]))
-                elif c == "peers":
-                    for uid, p in peers.items():
-                        print(f"{uid} @ {p['ip']} ({p['display_name']})")
-                elif c == "group" and len(parts) > 1:
-                    sub = parts[1]
-                    if sub == "create" and len(parts) > 2:
-                        rest = parts[2].split(" ", 1)
-                        gid = rest[0]
-                        mems = rest[1].split(",") if len(rest) > 1 else []
-                        create_group(gid, mems, f"Group {gid}")
-                    elif sub == "send" and len(parts) > 2:
-                        rest = parts[2].split(" ", 1)
-                        gid = rest[0]
-                        msg = rest[1] if len(rest) > 1 else ""
-                        send_group_message(gid, msg)
+    # Load avatar (optional)
+    avatar_path = "avatar.png"
+    if os.path.exists(avatar_path):
+        try:
+            with open(avatar_path, "rb") as f:
+                raw_data = f.read()
+                if len(raw_data) <= 20 * 1024:  # <20KB
+                    avatar_data = base64.b64encode(raw_data).decode('utf-8')
                 else:
-                    print("Unknown command. Type 'help'.")
-            except KeyboardInterrupt:
+                    print("[AVATAR] Too large (>20KB), skipping")
+        except Exception as e:
+            print(f"[AVATAR] Load failed: {e}")
+
+    # Start background threads
+    threading.Thread(target=listen_loop, daemon=True).start()
+    threading.Thread(target=send_ping, daemon=True).start()
+    threading.Thread(target=send_profile, daemon=True).start()
+
+    print(f"✅ Node '{display_name}' ({my_ip}) is online.")
+    print("Commands: post <text>, dm <name> <ip> <msg>, exit")
+    print("-" * 50)
+
+    # CLI Loop
+    while True:
+        try:
+            line = input("> ").strip()
+            if not line:
+                continue
+            cmd = line.split()
+
+            if cmd[0] == 'help':
+                print("Available commands:")
+                print("  post <message>          — Send public post")
+                print("  dm <name> <ip> <msg>    — Send direct message")
+                print("  exit                    — Quit")
+
+            elif cmd[0] == 'post' and len(cmd) > 1:
+                content = ' '.join(cmd[1:])
+                msg_id = ''.join(random.choices(string.hexdigits.lower(), k=16))
+                token = create_token(user_id, 'broadcast')
+                msg = build_message({
+                    "TYPE": "POST",
+                    "USER_ID": user_id,
+                    "CONTENT": content,
+                    "TTL": str(TTL_DEFAULT),
+                    "MESSAGE_ID": msg_id,
+                    "TOKEN": token
+                })
+                send_udp(msg, BROADCAST_ADDR)
+                posts[msg_id] = {'content': content, 'timestamp': time.time()}
+
+            elif cmd[0] == 'dm' and len(cmd) >= 4:
+                target_name, target_ip = cmd[1], cmd[2]
+                target_id = f"{target_name}@{target_ip}"
+                content = ' '.join(cmd[3:])
+                msg_id = ''.join(random.choices(string.hexdigits.lower(), k=16))
+                token = create_token(user_id, 'chat')
+                msg = build_message({
+                    "TYPE": "DM",
+                    "FROM": user_id,
+                    "TO": target_id,
+                    "CONTENT": content,
+                    "TIMESTAMP": str(int(time.time())),
+                    "MESSAGE_ID": msg_id,
+                    "TOKEN": token
+                })
+                send_reliable(msg, target_ip, msg_id)
+
+            elif cmd[0] == 'exit':
+                print("Shutting down...")
                 break
-            except Exception as e:
-                log(f"Command error: {e}", level="ERROR")
-    except EOFError:
-        pass
-    finally:
-        running = False
-        log("Shutting down...")
-        log_file.close()
-        sock.close()
+
+            else:
+                print("Unknown command. Type 'help'.")
+
+        except (EOFError, KeyboardInterrupt):
+            print("\nGoodbye!")
+            break
+        except Exception as e:
+            print(f"[ERROR] {e}")
+
+    sys.exit(0)
+
 
 if __name__ == "__main__":
     main()
