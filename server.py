@@ -97,17 +97,18 @@ def handle_message(data: bytes, addr):
                 headers[k.strip()] = v.strip()
 
         msg_type = headers.get("TYPE")
-        sender_id_full = headers.get("USER_ID") # Get the full USER_ID
-        sender_id = headers.get("USER_ID", "").split("@")[0] #Extract the simple ID
-        messages_to_send = []
+        sender_id_full = headers.get("USER_ID") or headers.get("FROM")
+        sender_id = (sender_id_full or "").split("@")[0]
         
         log(f"🔍 DECODED MESSAGE: {raw}") # DEBUG
-        if not sender_id and headers.get("FROM"): # for follow (it doesnt hve user_id field)
-            sender_id = headers.get("FROM").split("@")[0]
+        # if not sender_id and headers.get("FROM"): # for follow (it doesnt hve user_id field)
+        #     sender_id = headers.get("FROM").split("@")[0]
             
         if not msg_type or not sender_id:
-            log(f"❌ Missing TYPE or SENDER_ID") 
+            log(f"❌ Missing TYPE or SENDER_ID  | Headers: {headers}") 
             return
+        
+        messages_to_send = []
         
         log(f"2nd DECODED MESSAGE: {raw}") # DEBUG
         
@@ -244,6 +245,34 @@ def handle_message(data: bytes, addr):
                 # Broadcast the profile message to all other clients
                 for uid, info in clients.items():
                     send_udp(raw, info["ip"], info["port"])
+
+            elif msg_type == "TICTACTOE_INVITE":
+                gameid = headers.get("GAMEID")
+                player_x = headers.get("PLAYER_X", sender_id)
+                player_o = headers.get("PLAYER_O")
+                symbol = headers.get("SYMBOL", "X")
+                target = headers.get("TO")
+
+                if not gameid or not target:
+                    log(f"❌ Invalid TICTACTOE_INVITE from {sender_id} (missing GAMEID or TO)")
+                    return
+
+                # Rebuild invite message cleanly
+                invite_msg = (
+                    f"TYPE: TICTACTOE_INVITE\n"
+                    f"GAMEID: {gameid}\n"
+                    f"PLAYER_X: {player_x}\n"
+                    f"PLAYER_O: {player_o or 'waiting'}\n"
+                    f"SYMBOL: {symbol}\n"
+                    f"FROM: {sender_id}@{ip}\n"
+                    f"TO: {target}"
+                )
+
+                if target in clients:
+                    send_udp(invite_msg, clients[target]["ip"], clients[target]["port"])
+                    log(f"📤 TICTACTOE_INVITE sent from {sender_id} to {target}")
+                else:
+                    log(f"❌ TICTACTOE_INVITE target {target} not found")
                         
             else:
                 # Broadcast other message types

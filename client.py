@@ -146,16 +146,13 @@ def listen_loop():
                 clear_input()
                 print(f"👤 {name} unfollowed you!")
                 print_prompt()
-                
+
             elif msg_type == "TICTACTOE_INVITE":
-                gameid = headers.get("GAMEID")
-                player_x = headers.get("PLAYER_X")
-                player_o = headers.get("PLAYER_O")
-                x_name = peers.get(player_x, player_x)
-                o_name = peers.get(player_o, o_name)
+                from_user = headers.get("FROM", "").split("@")[0]
+                gameid = headers.get("GAMEID", "")
+                symbol = headers.get("SYMBOL", "X")
                 clear_input()
-                print(f"🎮 Game Invite: {gameid}")
-                print(f"   X: {x_name} | O: {o_name}")
+                print(f"{from_user} is inviting you to play tic-tac-toe (Game ID: {gameid}, They are {symbol})")
                 print_prompt()
 
             elif msg_type == "TICTACTOE_MOVE":
@@ -302,6 +299,31 @@ def unfollow(name: str):
     
     del following[match_uid]
     print(f"✅ Unfollowed {peers[match_uid]}")
+
+def tictactoe_invite(to_user: str):
+    if to_user not in peers:
+        print(f"❌ User '{to_user}' not found.")
+        return
+    
+    gameid = f"game-{random.randint(1000, 9999)}"
+    player_x = USER_ID
+    player_o = to_user
+    symbol = "X"  # inviter always X
+
+    msg = (
+        f"TYPE: TICTACTOE_INVITE\n"
+        f"GAMEID: {gameid}\n"
+        f"PLAYER_X: {player_x}\n"
+        f"PLAYER_O: {player_o}\n"
+        f"SYMBOL: {symbol}\n"
+        f"FROM: {USER_ID}@{get_my_ip()}\n"
+        f"TO: {to_user}"
+    )
+    send_udp(msg)
+
+    clear_input()
+    print(f"🎮 Game invite sent to {peers[to_user]} ({to_user})")
+    print_prompt()
     
 def show_help():
     print("""
@@ -398,8 +420,7 @@ def main():
                     elif c == "like" and len(parts) > 1:
                         print(f"❤️ Liked post {parts[1]}")
                     elif c == "game" and len(parts) > 1:
-                        
-                        print("🎮 Game invite sent (demo only)")
+                        tictactoe_invite(parts[1])
                     elif c == "move" and len(parts) > 2:
                         gameid, pos = parts[1], parts[2]
                         print(f"➡️ Move {pos} in game {gameid}")
