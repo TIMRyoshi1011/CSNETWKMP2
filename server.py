@@ -56,7 +56,7 @@ def cleanup_loop():
             log(f"Client timed out: {uid}")
         time.sleep(CLEANUP_INTERVAL)
 
-def validate_token(token: str, sender_id: str) -> bool:
+def validate_token(token: str, sender_id: str, scope: str) -> bool: # Modified to accept scope
     try:
         parts = token.split('|')
         if len(parts) != 3:
@@ -72,8 +72,8 @@ def validate_token(token: str, sender_id: str) -> bool:
         if time.time() > token_expiry:
             log(f"Token expired for {sender_id}", level="WARNING")
             return False
-        if token_scope != "chat": # Ensure token is for chat
-            log(f"Invalid token scope: {token_scope}", level="WARNING")
+        if token_scope != scope: # Validate against provided scope
+            log(f"Invalid token scope: Expected {scope}, Got {token_scope}", level="WARNING")
             return False
         return True
     except Exception as e:
@@ -82,14 +82,12 @@ def validate_token(token: str, sender_id: str) -> bool:
 
 def handle_message(data: bytes, addr):
     ip, port = addr
-    # log(f"🔍 RAW MESSAGE RECEIVED from {addr}: {data}")
     try:
         raw = data.decode('utf-8', errors='ignore').strip()
         if not raw.endswith("\n\n"):
             raw += "\n\n"
         lines = [line.strip() for line in raw.splitlines() if line.strip()]
         
-        #for debug:
         headers = {}
         for line in lines:
             if ':' in line:
@@ -99,18 +97,12 @@ def handle_message(data: bytes, addr):
         msg_type = headers.get("TYPE")
         sender_id_full = headers.get("USER_ID") or headers.get("FROM")
         sender_id = (sender_id_full or "").split("@")[0]
-        
-        # log(f"🔍 DECODED MESSAGE: {raw}") # DEBUG
-        # if not sender_id and headers.get("FROM"): # for follow (it doesnt hve user_id field)
-        #     sender_id = headers.get("FROM").split("@")[0]
             
         if not msg_type or not sender_id:
             log(f"❌ Missing TYPE or SENDER_ID  | Headers: {headers}") 
             return
         
         messages_to_send = []
-        
-        # log(f"2nd DECODED MESSAGE: {raw}") # DEBUG
         
         with lock:
             if msg_type == "REGISTER":
@@ -151,6 +143,11 @@ def handle_message(data: bytes, addr):
                 target = headers.get("TO")
                 if target in clients:
                     dest = clients[target]
+                    # Validate token for chat scope
+                    token = headers.get("TOKEN", "")
+                    if not validate_token(token, sender_id, "chat"):
+                        log(f"❌ Invalid token for DM from {sender_id} to {target}", level="WARNING")
+                        return
                     send_udp(raw, dest["ip"], dest["port"])
                     log(f"📤 DM forwarded from {sender_id} to {target}")
                 else:
@@ -161,25 +158,18 @@ def handle_message(data: bytes, addr):
                 if not sender:
                     return
                 token = headers.get("TOKEN", "")
-                ttl = int(headers.get("TTL", 3600))
-                message_id = headers.get("MESSAGE_ID")
-                try:
-                    # Validate token
-                    parts = token.split("|")
-                    if len(parts) != 3 or parts[0] != sender_id or parts[2] != "broadcast":
-                        return
-                    timestamp = int(parts[1]) - ttl
-                    if time.time() > timestamp + ttl:
-                        return  # expired token
-                except:
+                # Validate token for broadcast scope
+                if not validate_token(token, sender_id, "broadcast"):
+                    log(f"❌ Invalid token for POST from {sender_id}", level="WARNING")
                     return
+                
                 # Broadcast to followers only
                 for uid, info in clients.items():
                     if sender_id in info.get("follows", []):
                         send_udp(raw, info["ip"], info["port"])
                         
             elif msg_type == "FOLLOW":
-                target = headers.get("TO") #error validation on who user wants to follow
+                target = headers.get("TO")
                 log(f"🔍 FOLLOW request: {sender_id} wants to follow {target}")
                 
                 if not target or target == sender_id:
@@ -188,13 +178,17 @@ def handle_message(data: bytes, addr):
                     log(f"❌ Target {target} not online")
                     return
                 
+                # Validate token for follow scope
+                token = headers.get("TOKEN", "")
+                if not validate_token(token, sender_id, "follow"):
+                    log(f"❌ Invalid token for FOLLOW from {sender_id} to {target}", level="WARNING")
+                    return
+
                 #store new following
                 if target not in clients[sender_id]["follows"]:
                     clients[sender_id]["follows"].append(target)
                     clients[target]["followers"].append(sender_id)
                     log(f"✅ {sender_id} now follows {target}")
-                    
-                    # log(f"📊 {target} has followers: {clients[target]['followers']}")
 
                     notify = (
                         f"TYPE: FOLLOW_NOTIFY\n"
@@ -214,8 +208,7 @@ def handle_message(data: bytes, addr):
                     log(f"❌ Invalid UNFOLLOW request: Sender {sender_id} or target {target} not online")
                     return
                 
-                #store the previous state before modification for logging/notification
-                unfollowed_name = clients[target]["name"]
+                # No token validation for unfollow, as it's a revocation
 
                 # check if following first
                 if target in clients[sender_id]["follows"]:
@@ -231,7 +224,6 @@ def handle_message(data: bytes, addr):
                     send_udp(notify, clients[target]["ip"], clients[target]["port"])
                     
             elif msg_type == "PROFILE":
-                # log(f"Received PROFILE message from {sender_id}. Updating info...")
                 display_name = headers.get("DISPLAY_NAME")
                 status = headers.get("STATUS")
                 avatar_type = headers.get("AVATAR_TYPE")
@@ -251,7 +243,7 @@ def handle_message(data: bytes, addr):
                         clients[sender_id]["avatar_data"] = avatar_data
                     
                     avatar_info = f" (with avatar: {avatar_type})" if avatar_type else ""
-                    # log(f"📝 Profile update from {sender_id}: '{status}'{avatar_info}")
+                    log(f"📝 Profile update from {sender_id}: '{status}'{avatar_info}") # Changed to log for visibility
 
                 # Broadcast profile to all clients
                 for uid, info in clients.items():
@@ -284,6 +276,45 @@ def handle_message(data: bytes, addr):
                     log(f"📤 TICTACTOE_INVITE sent from {sender_id} to {target}")
                 else:
                     log(f"❌ TICTACTOE_INVITE target {target} not found")
+            
+            # --- New File Transfer Message Types ---
+            elif msg_type == "FILE_OFFER":
+                target = headers.get("TO")
+                if target in clients:
+                    # Validate token for file scope
+                    token = headers.get("TOKEN", "")
+                    if not validate_token(token, sender_id, "file"):
+                        log(f"❌ Invalid token for FILE_OFFER from {sender_id} to {target}", level="WARNING")
+                        return
+                    dest = clients[target]
+                    send_udp(raw, dest["ip"], dest["port"])
+                    log(f"📤 FILE_OFFER forwarded from {sender_id} to {target} for file {headers.get('FILENAME')}")
+                else:
+                    log(f"❌ FILE_OFFER target {target} not found")
+
+            elif msg_type == "FILE_CHUNK":
+                target = headers.get("TO")
+                if target in clients:
+                    # Validate token for file scope
+                    token = headers.get("TOKEN", "")
+                    if not validate_token(token, sender_id, "file"):
+                        log(f"❌ Invalid token for FILE_CHUNK from {sender_id} to {target}", level="WARNING")
+                        return
+                    dest = clients[target]
+                    send_udp(raw, dest["ip"], dest["port"])
+                    log(f"📤 FILE_CHUNK {headers.get('CHUNK_INDEX')}/{headers.get('TOTAL_CHUNKS')} forwarded from {sender_id} to {target} for file {headers.get('FILEID')}")
+                else:
+                    log(f"❌ FILE_CHUNK target {target} not found")
+
+            elif msg_type == "FILE_RECEIVED":
+                target = headers.get("TO") # This is the original sender of the file
+                if target in clients:
+                    dest = clients[target]
+                    send_udp(raw, dest["ip"], dest["port"])
+                    log(f"📤 FILE_RECEIVED notification forwarded from {sender_id} to {target} for file {headers.get('FILEID')}")
+                else:
+                    log(f"❌ FILE_RECEIVED target {target} not found")
+            # --- End New File Transfer Message Types ---
 
             elif msg_type == "TICTACTOE_MOVE":
                 target = headers.get("TO")
@@ -336,3 +367,4 @@ if __name__ == "__main__":
     log("🚀 Starting LSNP Server...")
     threading.Thread(target=cleanup_loop, daemon=True).start()
     listen_loop()
+
