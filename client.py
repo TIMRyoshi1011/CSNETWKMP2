@@ -117,9 +117,9 @@ def listen_loop():
             elif msg_type == "DM":
                 frm = headers.get("FROM", "").split("@")[0]
                 frm_name = peers.get(frm, frm)
-                msg = headers.get("MESSAGE", "")
+                content = headers.get("CONTENT", "")
                 clear_input()
-                print(f"[← {frm_name}] {msg}")
+                print(f"[← {frm_name}] {content}") 
                 print_prompt()
 
             elif msg_type == "POST":
@@ -197,16 +197,25 @@ def send_dm(to_user: str, message: str):
     if to_user not in peers:
         print(f"❌ User '{to_user}' not found.")
         return
+    
+    current_timestamp = int(time.time())
+    message_id = f"{USER_ID}-{current_timestamp}-{random.randint(1000,9999)}" # Simple unique ID
+    token_expiry = current_timestamp + 3600
+    token = f"{USER_ID}|{token_expiry}|chat"
+
     msg = (
         f"TYPE: DM\n"
         f"FROM: {USER_ID}@{get_my_ip()}\n"
         f"TO: {to_user}\n"
-        f"MESSAGE: {message}"
+        f"CONTENT: {message}\n" # Use CONTENT field
+        f"TIMESTAMP: {current_timestamp}\n"
+        f"MESSAGE_ID: {message_id}\n"
+        f"TOKEN: {token}"
     )
     send_udp(msg)
     target_name = peers.get(to_user, to_user)
     clear_input()
-    print(f"[→ {target_name}] {message}")
+    print(f"[→ {target_name}] {message}") # Print original message for sent confirmation
     print_prompt()
 
 def send_post(message: str):

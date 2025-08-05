@@ -56,6 +56,30 @@ def cleanup_loop():
             log(f"Client timed out: {uid}")
         time.sleep(CLEANUP_INTERVAL)
 
+def validate_token(token: str, sender_id: str) -> bool:
+    try:
+        parts = token.split('|')
+        if len(parts) != 3:
+            log(f"Invalid token format: {token}", level="WARNING")
+            return False
+        token_user_id = parts[0]
+        token_expiry = int(parts[1])
+        token_scope = parts[2]
+
+        if token_user_id != sender_id:
+            log(f"Token user ID mismatch: Expected {sender_id}, Got {token_user_id}", level="WARNING")
+            return False
+        if time.time() > token_expiry:
+            log(f"Token expired for {sender_id}", level="WARNING")
+            return False
+        if token_scope != "chat": # Ensure token is for chat
+            log(f"Invalid token scope: {token_scope}", level="WARNING")
+            return False
+        return True
+    except Exception as e:
+        log(f"Error validating token: {e}", level="ERROR")
+        return False
+
 def handle_message(data: bytes, addr):
     ip, port = addr
     # log(f"🔍 RAW MESSAGE RECEIVED from {addr}: {data}")
@@ -234,11 +258,17 @@ def handle_message(data: bytes, addr):
         log(f"Error handling packet: {e}", level="ERROR")
 
 def forward_message(headers: Dict[str, Any], target: str):
-    msg = "\n".join([f"{k}: {v}" for k, v in headers.items()])
+    msg_lines = []
+    for k, v in headers.items():
+        msg_lines.append(f"{k}: {v}")
+    msg = "\n".join(msg_lines)
+
     with lock:
         if target in clients:
             dest = clients[target]
             send_udp(msg, dest["ip"], dest["port"])
+        else:
+            log(f"Attempted to forward message to unknown target {target}", level="WARNING")
 
 def listen_loop():
     global sock
