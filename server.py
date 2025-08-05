@@ -58,8 +58,10 @@ def cleanup_loop():
 
 def handle_message(data: bytes, addr):
     ip, port = addr
+    log(f"🔍 RAW MESSAGE RECEIVED from {addr}: {data}")
     try:
         raw = data.decode('utf-8', errors='ignore').strip()
+        log(f"🔍 DECODED MESSAGE: {raw}")
         if not raw.endswith("\n\n"):
             raw += "\n\n"
         lines = [line.strip() for line in raw.splitlines() if line.strip()]
@@ -74,14 +76,25 @@ def handle_message(data: bytes, addr):
 
         if not msg_type or not sender_id:
             return
+        
+        if not sender_id and headers.get("FROM"): # for follow (it doesnt hve user_id field)
+            sender_id = headers.get("FROM").split("@")[0]
+            
+        log(f"🔍 PARSED: TYPE={msg_type}, SENDER={sender_id}")  # debug
 
+        if not msg_type or not sender_id:
+            log(f"❌ Missing TYPE or SENDER_ID") 
+            return
+        
         with lock:
             if msg_type == "REGISTER":
                 clients[sender_id] = {
                     "ip": ip,
                     "port": port,
                     "name": headers.get("DISPLAY_NAME", "Anonymous"),
-                    "last_seen": time.time()
+                    "last_seen": time.time(),
+                    "follows": [],      
+                    "followers": []   
                 }
                 log(f"✅ Registered: {sender_id}")
                 # Send welcome + peer list
@@ -114,8 +127,63 @@ def handle_message(data: bytes, addr):
                     target = headers.get("TO")
                     if target in clients:
                         forward_message(headers, target)
+                ##
+                elif msg_type == "POST":
+                    sender = clients.get(sender_id)
+                    if not sender:
+                        return
+                    token = headers.get("TOKEN", "")
+                    ttl = int(headers.get("TTL", 3600))
+                    message_id = headers.get("MESSAGE_ID")
+                    try:
+                        # Validate token
+                        parts = token.split("|")
+                        if len(parts) != 3 or parts[0] != sender_id or parts[2] != "broadcast":
+                            return
+                        timestamp = int(parts[1]) - ttl
+                        if time.time() > timestamp + ttl:
+                            return  # expired token
+                    except:
+                        return
+                    # Broadcast to followers only
+                    for uid, info in clients.items():
+                        if sender_id in info.get("follows", []):
+                            send_udp(raw, info["ip"], info["port"])
+                            
+                elif msg_type == "FOLLOW":
+                    target = headers.get("TO") #error validation on who user wants to follow
+                    log(f"🔍 FOLLOW request: {sender_id} wants to follow {target}")
+                    
+                    if not target or target == sender_id:
+                        return
+                    if target not in clients:
+                        log(f"❌ Target {target} not online")
+                        return
+                    
+                    #store new following
+                    if target not in clients[sender_id]["follows"]:
+                        clients[sender_id]["follows"].append(target)
+                        clients[target]["followers"].append(sender_id)
+                        log(f"✅ {sender_id} now follows {target}")
+                        
+                        # Print debug info
+                        log(f"📊 {sender_id} follows: {clients[sender_id]['follows']}")
+                        log(f"📊 {target} has followers: {clients[target]['followers']}")
+    
+                    notify = (
+                        f"TYPE: FOLLOW_NOTIFY\n"
+                        f"USER_ID: {sender_id}\n"
+                        f"DISPLAY_NAME: {clients[sender_id]['name']}"
+                    )
+                    log(f"📤 Sending FOLLOW_NOTIFY to {target}") 
+                    send_udp(notify, clients[target]["ip"], clients[target]["port"])
+
+                        
+                # elif msg_type == "FOLLOW_NOTIFY":
+                #     # Do nothing (handled client-side)
+                #     pass        
                 else:
-                    # Broadcast to all except sender
+                    # Broadcast other message types
                     for uid, info in clients.items():
                         if uid != sender_id:
                             send_udp(raw, info["ip"], info["port"])

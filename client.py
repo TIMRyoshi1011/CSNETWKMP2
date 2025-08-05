@@ -31,6 +31,8 @@ USER_ID = ""
 DISPLAY_NAME = ""
 server_addr = (SERVER_IP, UDP_PORT)
 peers = {}  # user_id -> display_name
+followers = {}
+following = {}
 
 def log(msg, level="INFO"):
     print(f"[{level}] {msg}")
@@ -112,6 +114,18 @@ def listen_loop():
                 clear_input()
                 print(f"[POST][{frm_name}] {msg}")
                 print_prompt()
+                
+            elif msg_type == "FOLLOW_NOTIFY":
+                uid = headers.get("USER_ID", "")
+                name = headers.get("DISPLAY_NAME", uid)
+                print(f"🐛 DEBUG: Received FOLLOW_NOTIFY from {uid} ({name})")  # ADD THIS
+                print(f"🐛 DEBUG: Current followers before: {followers}")    
+                
+                followers[uid] = name 
+                clear_input()
+                print(f"👤 {name} followed you!")
+                print(f"🐛 DEBUG: Current followers after: {followers}") 
+                print_prompt()
 
             elif msg_type == "TICTACTOE_INVITE":
                 gameid = headers.get("GAMEID")
@@ -180,7 +194,38 @@ def get_my_ip():
         return ip
     except:
         return "127.0.0.1"
+    
+def follow(name: str):
+    name = name.strip().lower()
+    match_uid = None
+    for uid, display in peers.items():
+        if display.lower() == name:
+            match_uid = uid
+            break
+    if not match_uid:
+        print(f"❌ No peer found with display name '{name}'")
+        return
+    if match_uid in following:
+        print(f"❌ Already following {peers[match_uid]}")
+        return
 
+    timestamp = int(time.time())
+    ttl = 3600
+    token = f"{USER_ID}|{timestamp+ttl}|follow"
+    msg_id = hex(random.getrandbits(64))[2:]
+    msg = (
+        f"TYPE: FOLLOW\n"
+        f"MESSAGE_ID: {msg_id}\n"
+        f"FROM: {USER_ID}@{get_my_ip()}\n"
+        f"TO: {match_uid}\n"
+        f"TIMESTAMP: {timestamp}\n"
+        f"TOKEN: {token}"
+    )
+    send_udp(msg)
+    
+    following[match_uid] = peers[match_uid]
+    print(f"✅ Following {peers[match_uid]}")
+    
 def show_help():
     print("""
 Commands:
@@ -257,7 +302,7 @@ def main():
                     elif c == "dm" and len(parts) >= 3:
                         send_dm(parts[1], parts[2])
                     elif c == "follow" and len(parts) > 1:
-                        print(f"✅ Now following @{parts[1]}")
+                        follow(parts[1])
                     elif c == "like" and len(parts) > 1:
                         print(f"❤️ Liked post {parts[1]}")
                     elif c == "game" and len(parts) > 1:
@@ -274,6 +319,10 @@ def main():
                         elif parts[1] == "send" and len(parts) > 2:
                             gid, msg = parts[2].split(" ", 1)
                             print(f"[togroup {gid}] {msg}")
+                    elif c == "debug":
+                        print("🔍 Debug Info:")
+                        print(f"Following: {following}")
+                        print(f"Followers: {followers}")
                     else:
                         print("❌ Unknown command. Type 'help'.")
                 print_prompt()
