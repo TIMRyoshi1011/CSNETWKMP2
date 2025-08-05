@@ -118,13 +118,9 @@ def listen_loop():
             elif msg_type == "FOLLOW_NOTIFY":
                 uid = headers.get("USER_ID", "")
                 name = headers.get("DISPLAY_NAME", uid)
-                print(f"🐛 DEBUG: Received FOLLOW_NOTIFY from {uid} ({name})")  # ADD THIS
-                print(f"🐛 DEBUG: Current followers before: {followers}")    
-                
                 followers[uid] = name 
                 clear_input()
                 print(f"👤 {name} followed you!")
-                print(f"🐛 DEBUG: Current followers after: {followers}") 
                 print_prompt()
 
             elif msg_type == "TICTACTOE_INVITE":

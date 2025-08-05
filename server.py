@@ -58,13 +58,14 @@ def cleanup_loop():
 
 def handle_message(data: bytes, addr):
     ip, port = addr
-    log(f"🔍 RAW MESSAGE RECEIVED from {addr}: {data}")
+    # log(f"🔍 RAW MESSAGE RECEIVED from {addr}: {data}")
     try:
         raw = data.decode('utf-8', errors='ignore').strip()
-        log(f"🔍 DECODED MESSAGE: {raw}")
         if not raw.endswith("\n\n"):
             raw += "\n\n"
         lines = [line.strip() for line in raw.splitlines() if line.strip()]
+        
+        #for debug:
         headers = {}
         for line in lines:
             if ':' in line:
@@ -74,13 +75,11 @@ def handle_message(data: bytes, addr):
         msg_type = headers.get("TYPE")
         sender_id = headers.get("USER_ID")
 
-        if not msg_type or not sender_id:
-            return
-        
         if not sender_id and headers.get("FROM"): # for follow (it doesnt hve user_id field)
             sender_id = headers.get("FROM").split("@")[0]
             
-        log(f"🔍 PARSED: TYPE={msg_type}, SENDER={sender_id}")  # debug
+        if not msg_type or not sender_id:
+            return
 
         if not msg_type or not sender_id:
             log(f"❌ Missing TYPE or SENDER_ID") 
@@ -178,10 +177,7 @@ def handle_message(data: bytes, addr):
                     log(f"📤 Sending FOLLOW_NOTIFY to {target}") 
                     send_udp(notify, clients[target]["ip"], clients[target]["port"])
 
-                        
-                # elif msg_type == "FOLLOW_NOTIFY":
-                #     # Do nothing (handled client-side)
-                #     pass        
+                    
                 else:
                     # Broadcast other message types
                     for uid, info in clients.items():
