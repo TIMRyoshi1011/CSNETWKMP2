@@ -1,30 +1,28 @@
 #!/usr/bin/env python3
 """
 Lightweight Social Networking Protocol (LSNP)
-Implementation with UDP, Discovery, Messaging, File Transfer, and Games
+Fully Fixed Version: Terminal-to-Terminal Chat, Discovery, DM, Games
 """
 
 import socket
 import threading
 import time
-import json
 import os
 import base64
 import sys
 import argparse
 import random
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional
 
 # =============================
 # Configuration
 # =============================
-
 UDP_PORT = 50999
-BROADCAST_INTERVAL = 300  # seconds
+BROADCAST_INTERVAL = 300       # Faster for testing
 MAX_RETRIES = 3
 ACK_TIMEOUT = 2
-LOSS_RATE = 0.2  # 20% packet loss in test mode
+LOSS_RATE = 0.0  # Set to 0.1–0.3 to test loss
 BUFFER_SIZE = 8192
 VERBOSE = False
 TEST_LOSS = False
@@ -32,13 +30,12 @@ TEST_LOSS = False
 # =============================
 # Global State
 # =============================
-
 running = True
 sock = None
-message_queue = []  # Thread-safe via locks
+message_queue = []
 message_lock = threading.Lock()
 
-# Local user config (load from file or args)
+# Local user config
 USER_ID = "user_" + str(random.randint(1000, 9999))
 DISPLAY_NAME = "Anonymous"
 AVATAR = "https://example.com/avatar.png"
@@ -46,16 +43,14 @@ AVATAR = "https://example.com/avatar.png"
 # Data stores
 peers = {}  # user_id -> {ip, display_name, avatar, last_seen}
 tokens = {}  # token -> {scope, expiry, revoked}
-outbox = {}  # msg_id -> {msg, dest_ip, retries, sent_time, acked}
-games = {}  # game_id -> {player_x, player_o, board, turn, moves, status}
+games = {}  # game_id -> game state
 groups = {}  # group_id -> {name, members}
-received_chunks = {}  # fileid -> {total, chunks: [data], sender}
+received_chunks = {}  # fileid -> {total, chunks, sender}
 log_file = open("peer_log.txt", "a", buffering=1)
 
 # =============================
 # Utilities
 # =============================
-
 def timestamp():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -84,19 +79,26 @@ def generate_msgid():
 def generate_fileid():
     return f"file_{random.randint(10000, 99999)}"
 
-def send_udp( str, ip: str, port: int = UDP_PORT):
+# ✅ FIXED: send_udp function
+def send_udp(data: str, ip: str, port: int = UDP_PORT):
+    """Send UDP packet with optional simulated loss."""
+    if not data.endswith("\n\n"):
+        data += "\n\n"  # Ensure proper termination
+
     if TEST_LOSS and random.random() < LOSS_RATE:
         log(f"[LOSS] Dropped packet to {ip}: {data[:50]}...", level="DEBUG")
         return
+
     try:
         sock.sendto(data.encode('utf-8'), (ip, port))
+        if VERBOSE:
+            log(f"Sent to {ip}: {data.strip()}", level="DEBUG")
     except Exception as e:
         log(f"Send failed to {ip}: {e}", level="ERROR")
 
 # =============================
 # Token System
 # =============================
-
 def create_token(scope: str, duration: int = 3600):
     token = f"tkn_{scope}_{random.randint(1000, 9999)}"
     tokens[token] = {
@@ -115,9 +117,8 @@ def validate_token(token: str, required_scope: str) -> bool:
     return t["scope"] == required_scope
 
 # =============================
-# Peer Discovery (Simulated mDNS)
+# Peer Discovery
 # =============================
-
 def broadcast_profile():
     while running:
         msg = (
@@ -151,30 +152,38 @@ def handle_profile(msg: str, sender_ip: str):
             "avatar": avatar,
             "last_seen": time.time()
         }
-        log(f"Discovered peer: {user_id} @ {sender_ip}")
+        log(f"Discovered peer: {user_id} ({display_name}) @ {sender_ip}", level="INFO")
 
 def handle_ping(msg: str, sender_ip: str, sender_port: int):
-    # Reply with PONG
     pong = f"TYPE: PONG\nUSER_ID: {USER_ID}\n\n"
     send_udp(pong, sender_ip, sender_port)
 
 # =============================
 # ACK & Retry System
 # =============================
-
 def send_with_retry(msg: str, dest_ip: str, msg_id: str, scope: str):
     token = create_token(scope)
-    msg = msg.replace("\n\n", f"TOKEN: {token}\nMSGID: {msg_id}\n\n")
+    if "\n\n" in msg:
+        msg = msg.replace("\n\n", f"TOKEN: {token}\nMSGID: {msg_id}\n\n")
+    else:
+        msg += f"TOKEN: {token}\nMSGID: {msg_id}\n\n"
+
     retries = 0
     while retries < MAX_RETRIES and running:
         send_udp(msg, dest_ip)
         log(f"Sent {msg_id} to {dest_ip} (retry {retries})", level="DEBUG")
         start = time.time()
+        acked = False
         while time.time() - start < ACK_TIMEOUT:
             with message_lock:
-                if msg_id in [m.get("ack_for") for m in message_queue if m.get("type") == "ACK"]:
-                    log(f"ACK received for {msg_id}", level="DEBUG")
-                    return True
+                for m in message_queue:
+                    if m["type"] == "ACK" and extract_field(m["raw"], "MSGID") == msg_id:
+                        message_queue.remove(m)
+                        acked = True
+                        break
+            if acked:
+                log(f"ACK received for {msg_id}", level="DEBUG")
+                return True
             time.sleep(0.1)
         retries += 1
     log(f"Failed to send {msg_id} after {MAX_RETRIES} retries", level="ERROR")
@@ -183,17 +192,14 @@ def send_with_retry(msg: str, dest_ip: str, msg_id: str, scope: str):
 def send_ack(msgid: str, dest_ip: str):
     ack = f"TYPE: ACK\nMSGID: {msgid}\n\n"
     send_udp(ack, dest_ip)
-    log(f"Sent ACK for {msgid}", level="DEBUG")
 
 # =============================
 # Core Messaging
 # =============================
-
 def send_post(message: str, image: str = ""):
     msg = f"TYPE: POST\nMESSAGE: {message}"
     if image:
         msg += f"\nIMAGE: {image}"
-    msg += "\n\n"
     msg_id = generate_msgid()
     for peer_id, info in peers.items():
         send_with_retry(msg, info["ip"], msg_id, "chat")
@@ -202,20 +208,23 @@ def send_dm(to_user: str, message: str):
     if to_user not in peers:
         log(f"User {to_user} not found", level="ERROR")
         return
-    msg = f"TYPE: DM\nTO: {to_user}\nMESSAGE: {message}\n\n"
+    msg = f"TYPE: DM\nTO: {to_user}\nMESSAGE: {message}"
     msg_id = generate_msgid()
-    send_with_retry(msg, peers[to_user]["ip"], msg_id, "dm")
+    sent = send_with_retry(msg, peers[to_user]["ip"], msg_id, "dm")
+    if sent:
+        target_name = peers[to_user]["display_name"]
+        print(f"[→ {target_name}] {message}")
 
 def send_follow(target: str):
     if target not in peers:
         log(f"User {target} not found", level="ERROR")
         return
-    msg = f"TYPE: FOLLOW\nTARGET_USER: {target}\n\n"
+    msg = f"TYPE: FOLLOW\nTARGET_USER: {target}"
     msg_id = generate_msgid()
     send_with_retry(msg, peers[target]["ip"], msg_id, "follow")
 
 def toggle_like(post_id: str):
-    msg = f"TYPE: LIKE\nPOST_ID: {post_id}\n\n"
+    msg = f"TYPE: LIKE\nPOST_ID: {post_id}"
     msg_id = generate_msgid()
     for peer_id, info in peers.items():
         send_with_retry(msg, info["ip"], msg_id, "like")
@@ -223,11 +232,14 @@ def toggle_like(post_id: str):
 # =============================
 # File Transfer
 # =============================
-
 def send_file(to_user: str, filepath: str):
     if to_user not in peers:
         log(f"User {to_user} not found", level="ERROR")
         return
+    if not os.path.exists(filepath):
+        log(f"File not found: {filepath}", level="ERROR")
+        return
+
     filename = os.path.basename(filepath)
     filesize = os.path.getsize(filepath)
     fileid = generate_fileid()
@@ -237,12 +249,11 @@ def send_file(to_user: str, filepath: str):
         f"FILENAME: {filename}\n"
         f"FILESIZE: {filesize}\n"
         f"FILEID: {fileid}\n"
-        f"TO: {to_user}\n\n"
+        f"TO: {to_user}"
     )
     msg_id = generate_msgid()
     if send_with_retry(offer, peers[to_user]["ip"], msg_id, "file"):
         log(f"File offer sent: {filename}")
-        # Start sending chunks after ACK
         threading.Thread(target=send_file_chunks, args=(filepath, fileid, peers[to_user]["ip"]), daemon=True).start()
 
 def send_file_chunks(filepath: str, fileid: str, dest_ip: str):
@@ -256,7 +267,7 @@ def send_file_chunks(filepath: str, fileid: str, dest_ip: str):
             f"FILEID: {fileid}\n"
             f"CHUNK_NUM: {idx+1}\n"
             f"TOTAL_CHUNKS: {len(chunks)}\n"
-            f"DATA: {b64_data}\n\n"
+            f"DATA: {b64_data}"
         )
         chunk_id = f"chunk_{fileid}_{idx}"
         send_with_retry(msg, dest_ip, chunk_id, "file")
@@ -268,8 +279,8 @@ def handle_file_chunk(msg: str, sender_ip: str):
     data_b64 = extract_field(msg, "DATA")
     try:
         data = base64.b64decode(data_b64)
-    except:
-        log("Invalid Base64 in chunk", level="ERROR")
+    except Exception as e:
+        log(f"Base64 decode error: {e}", level="ERROR")
         return
 
     if fileid not in received_chunks:
@@ -283,15 +294,12 @@ def handle_file_chunk(msg: str, sender_ip: str):
         received_chunks[fileid]["chunks"][chunk_num - 1] = data
         log(f"Received chunk {chunk_num}/{total_chunks} of {fileid}")
 
-    # Check if complete
     if all(received_chunks[fileid]["chunks"]):
-        final_data = b''.join(received_chunks[fileid]["chunks"])
-        filename = f"received/received_{fileid}"
+        final_data = b''.join(filter(None, received_chunks[fileid]["chunks"]))
         os.makedirs("received", exist_ok=True)
-        with open(filename, "wb") as f:
+        with open(f"received/received_{fileid}", "wb") as f:
             f.write(final_data)
-        log(f"File saved: {filename}")
-        # Send FILE_RECEIVED
+        log(f"File saved: received/received_{fileid}")
         confirm = f"TYPE: FILE_RECEIVED\nFILEID: {fileid}\n\n"
         send_udp(confirm, received_chunks[fileid]["sender"])
         del received_chunks[fileid]
@@ -299,7 +307,6 @@ def handle_file_chunk(msg: str, sender_ip: str):
 # =============================
 # Tic Tac Toe
 # =============================
-
 def render_grid(gameid: str):
     if gameid not in games:
         return
@@ -328,7 +335,7 @@ def start_game(invite_to: str):
         "moves": [],
         "status": "active"
     }
-    msg = f"TYPE: TICTACTOE_INVITE\nGAMEID: {gameid}\nPLAYER_X: {USER_ID}\nPLAYER_O: {invite_to}\n\n"
+    msg = f"TYPE: TICTACTOE_INVITE\nGAMEID: {gameid}\nPLAYER_X: {USER_ID}\nPLAYER_O: {invite_to}"
     msg_id = generate_msgid()
     send_with_retry(msg, peers[invite_to]["ip"], msg_id, "game")
     log(f"Invited {invite_to} to game {gameid}")
@@ -351,8 +358,7 @@ def make_move(gameid: str, pos: int):
     g["moves"].append((g["turn"], pos, USER_ID))
     g["turn"] += 1
 
-    msg = f"TYPE: TICTACTOE_MOVE\nGAMEID: {gameid}\nPOS: {pos}\nTURN: {g['turn']-1}\n\n"
-    # Send to opponent
+    msg = f"TYPE: TICTACTOE_MOVE\nGAMEID: {gameid}\nPOS: {pos}\nTURN: {g['turn']-1}"
     opp = g["player_o"] if USER_ID == g["player_x"] else g["player_x"]
     if opp in peers:
         msg_id = generate_msgid()
@@ -364,7 +370,7 @@ def handle_invite(msg: str, sender_ip: str):
     player_x = extract_field(msg, "PLAYER_X")
     player_o = extract_field(msg, "PLAYER_O")
     if gameid in games:
-        return  # Already exists
+        return
     games[gameid] = {
         "player_x": player_x,
         "player_o": player_o,
@@ -373,7 +379,7 @@ def handle_invite(msg: str, sender_ip: str):
         "moves": [],
         "status": "active"
     }
-    log(f"Invited to game {gameid} by {player_x}")
+    log(f"🎮 Invited to game {gameid} by {player_x}")
     render_grid(gameid)
 
 def handle_move(msg: str, sender_ip: str):
@@ -383,7 +389,6 @@ def handle_move(msg: str, sender_ip: str):
     if gameid not in games:
         return
     g = games[gameid]
-    # Prevent duplicates
     if turn <= len(g["moves"]):
         log(f"Duplicate move {turn} in game {gameid}", level="DEBUG")
         return
@@ -397,7 +402,6 @@ def handle_move(msg: str, sender_ip: str):
 # =============================
 # Group Messaging
 # =============================
-
 def create_group(group_id: str, members: List[str], name: str):
     valid_members = [m for m in members if m in peers]
     groups[group_id] = {
@@ -408,27 +412,27 @@ def create_group(group_id: str, members: List[str], name: str):
         f"TYPE: GROUP_CREATE\n"
         f"GROUP_ID: {group_id}\n"
         f"NAME: {name}\n"
-        f"MEMBERS: {','.join(valid_members)}\n\n"
+        f"MEMBERS: {','.join(valid_members)}"
     )
     msg_id = generate_msgid()
     for member in valid_members:
-        if member != USER_ID:
-            send_with_retry(msg, peers[member]["ip"], msg_id + "_" + member, "group")
+        if member != USER_ID and member in peers:
+            send_with_retry(msg, peers[member]["ip"], msg_id, "group")
 
 def send_group_message(group_id: str, message: str):
     if group_id not in groups:
         log("Group not found", level="ERROR")
         return
-    msg = f"TYPE: GROUP_MESSAGE\nGROUP_ID: {group_id}\nMESSAGE: {message}\n\n"
+    msg = f"TYPE: GROUP_MESSAGE\nGROUP_ID: {group_id}\nMESSAGE: {message}"
     msg_id = generate_msgid()
     for member in groups[group_id]["members"]:
         if member != USER_ID and member in peers:
             send_with_retry(msg, peers[member]["ip"], msg_id, "group")
+    print(f"[togroup {group_id}] {message}")
 
 # =============================
 # UDP Listener
 # =============================
-
 def listen_loop():
     global running
     while running:
@@ -450,9 +454,9 @@ def listen_loop():
 
             # IP validation
             claimed_from = extract_field(raw_msg, "FROM")
-            if claimed_from:
-                claimed_ip = claimed_from.split("@")[1] if "@" in claimed_from else None
-                if claimed_ip and claimed_ip != ip:
+            if claimed_from and "@" in claimed_from:
+                claimed_ip = claimed_from.split("@")[1]
+                if claimed_ip != ip:
                     log(f"SECURITY WARNING: IP mismatch. Claimed={claimed_ip}, Actual={ip}", level="WARN")
                     continue
 
@@ -468,7 +472,7 @@ def listen_loop():
                 log(f"Invalid token in {msg_type} from {ip}", level="WARN")
                 continue
 
-            # Add to queue
+            # Queue message
             with message_lock:
                 message_queue.append({
                     "raw": raw_msg,
@@ -478,7 +482,7 @@ def listen_loop():
                     "time": time.time()
                 })
 
-            # Send ACK if needed
+            # Send ACK if message has MSGID
             msgid = extract_field(raw_msg, "MSGID")
             if msgid:
                 send_ack(msgid, ip)
@@ -491,20 +495,17 @@ def listen_loop():
 # =============================
 # Message Processor
 # =============================
-
 def process_messages():
     while running:
+        time.sleep(0.01)
         with message_lock:
-            if message_queue:
-                msg = message_queue.pop(0)
-            else:
-                msg = None
-        if msg:
+            queue_copy = message_queue.copy()
+            message_queue.clear()
+        for msg in queue_copy:
             t = msg["type"]
             ip = msg["ip"]
             raw = msg["raw"]
             log(f"RX {t} from {ip}", level="DEBUG")
-
             if t == "PROFILE":
                 handle_profile(raw, ip)
             elif t == "PING":
@@ -519,20 +520,33 @@ def process_messages():
                 handle_invite(raw, ip)
             elif t == "TICTACTOE_MOVE":
                 handle_move(raw, ip)
-            elif t in ["POST", "DM", "FOLLOW", "LIKE", "GROUP_CREATE", "GROUP_MESSAGE"]:
-                # Just log for now
-                log(f"{t}: {extract_field(raw, 'MESSAGE') or '...'}", level="INFO")
+            elif t == "DM":
+                to_user = extract_field(raw, "TO")
+                if to_user == USER_ID:
+                    sender = extract_field(raw, "FROM")
+                    sender = sender.split("@")[0] if sender and "@" in sender else "someone"
+                    sender_name = peers.get(sender, {}).get("display_name", sender)
+                    message = extract_field(raw, "MESSAGE") or "No message"
+                    sys.stdout.write('\r' + ' ' * 60 + '\r')  # Clear line
+                    print(f"[← {sender_name}] {message}")
+                    print("> ", end="", flush=True)
+            elif t == "POST":
+                sender = extract_field(raw, "FROM")
+                sender = sender.split("@")[0] if sender and "@" in sender else "someone"
+                sender_name = peers.get(sender, {}).get("display_name", sender)
+                message = extract_field(raw, "MESSAGE") or ""
+                sys.stdout.write('\r' + ' ' * 60 + '\r')
+                print(f"[POST][{sender_name}] {message}")
+                print("> ", end="", flush=True)
             elif t == "ACK":
                 msgid = extract_field(raw, "MSGID")
-                with message_lock:
-                    # Mark as received
-                    pass  # We use polling in send_with_retry
-        time.sleep(0.01)
+                # Handled in send_with_retry
+            else:
+                log(f"Unhandled message type: {t}", level="DEBUG")
 
 # =============================
 # CLI & Main
 # =============================
-
 def show_help():
     print("""
 Commands:
@@ -550,17 +564,11 @@ Commands:
   exit                     - Quit
 """)
 
-# =============================
-# Improved Main Loop with Real-Time Chat
-# =============================
-
 def clear_input_line():
-    """Clear the current input line to print incoming messages."""
     sys.stdout.write('\r' + ' ' * 60 + '\r')
     sys.stdout.flush()
 
 def print_prompt():
-    """Show the input prompt."""
     sys.stdout.write("> ")
     sys.stdout.flush()
 
@@ -587,152 +595,90 @@ def main():
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         sock.bind(("", UDP_PORT))
-        sock.settimeout(0.1)  # Short timeout for input polling
+        sock.settimeout(0.1)
     except Exception as e:
         log(f"Bind failed: {e}", level="ERROR")
         return
 
-    # Start background threads
+    # Start threads
     threading.Thread(target=listen_loop, daemon=True).start()
     threading.Thread(target=process_messages, daemon=True).start()
     threading.Thread(target=broadcast_profile, daemon=True).start()
 
-    # Wait a moment for peers
-    time.sleep(1)
+    time.sleep(2)  # Allow discovery
 
-    # === REAL-TIME INPUT LOOP ===
+    show_help()
+    print("> ", end="", flush=True)
+
     import os
-    if os.name == "nt":  # Windows
+    if os.name == "nt":
         import msvcrt
-
-        def kbhit():
-            return msvcrt.kbhit()
-
         def get_input():
-            if kbhit():
-                buffer = ""
-                while True:
-                    char = msvcrt.getch().decode('utf-8', errors='ignore')
-                    if char == '\r':  # Enter
-                        sys.stdout.write('\n')
-                        return buffer
-                    elif char == '\b':  # Backspace
-                        if buffer:
-                            buffer = buffer[:-1]
-                            sys.stdout.write('\b \b')
-                    else:
-                        buffer += char
-                        sys.stdout.write(char)
-                    sys.stdout.flush()
+            if msvcrt.kbhit():
+                return msvcrt.getch().decode('utf-8', errors='ignore')
             return None
-    else:  # Unix/Linux/macOS
+    else:
         import select
-        import tty
-        import termios
-
         def get_input():
             if select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], []):
-                return sys.stdin.readline().strip()
+                return sys.stdin.read(1)
             return None
 
-    # Show help
-    show_help()
-    print_prompt()
-
+    buffer = ""
     try:
         while running:
-            # Check for user input
-            cmd = get_input()
-            if cmd is not None:
-                parts = cmd.strip().split(" ", 2)
-                if not parts or not parts[0]:
-                    print_prompt()
-                    continue
+            char = get_input()
+            if char == '\r' or char == '\n':
+                cmd = buffer.strip()
+                buffer = ""
+                if cmd:
+                    parts = cmd.split(" ", 2)
+                    c = parts[0].lower()
+                    if c == "exit":
+                        break
+                    elif c == "help":
+                        show_help()
+                    elif c == "peers":
+                        print("\n--- Peers ---")
+                        for uid, p in peers.items():
+                            print(f"{uid} ({p['display_name']}) @ {p['ip']}")
+                        print("-------------")
+                    elif c == "post" and len(parts) > 1:
+                        send_post(parts[1])
+                        print(f"[You] {parts[1]}")
+                    elif c == "dm" and len(parts) >= 3:
+                        send_dm(parts[1], parts[2])
+                    elif c == "follow" and len(parts) > 1:
+                        send_follow(parts[1])
+                    elif c == "like" and len(parts) > 1:
+                        toggle_like(parts[1])
+                    elif c == "file" and len(parts) > 2:
+                        send_file(parts[1], parts[2])
+                    elif c == "game" and len(parts) > 1:
+                        start_game(parts[1])
+                    elif c == "move" and len(parts) > 2:
+                        make_move(parts[1], int(parts[2]))
+                    elif c == "group" and len(parts) > 1:
+                        if parts[1] == "create" and len(parts) > 2:
+                            gid, *mems = parts[2].split()
+                            create_group(gid, mems, f"Group {gid}")
+                        elif parts[1] == "send" and len(parts) > 2:
+                            gid, msg = parts[2].split(" ", 1)
+                            send_group_message(gid, msg)
+                    else:
+                        print("Unknown command. Type 'help'.")
+                print("> ", end="", flush=True)
+            elif char == '\b':
+                if buffer:
+                    buffer = buffer[:-1]
+                    sys.stdout.write('\b \b')
+                    sys.stdout.flush()
+            elif char:
+                buffer += char
+                sys.stdout.write(char)
+                sys.stdout.flush()
 
-                c = parts[0].lower()
-
-                if c == "exit":
-                    break
-                elif c == "help":
-                    show_help()
-                    print_prompt()
-                elif c == "post" and len(parts) > 1:
-                    send_post(parts[1])
-                    print(f"[You] {parts[1]}")
-                    print_prompt()
-                elif c == "dm" and len(parts) >= 3:
-                    target = parts[1]
-                    msg = parts[2]
-                    send_dm(target, msg)
-                    target_name = peers.get(target, {}).get("display_name", target)
-                    print(f"[→ {target_name}] {msg}")
-                    print_prompt()
-                elif c == "follow" and len(parts) > 1:
-                    send_follow(parts[1])
-                    print_prompt()
-                elif c == "like" and len(parts) > 1:
-                    toggle_like(parts[1])
-                    print_prompt()
-                elif c == "file" and len(parts) > 2:
-                    send_file(parts[1], parts[2])
-                    print_prompt()
-                elif c == "game" and len(parts) > 1:
-                    start_game(parts[1])
-                    print_prompt()
-                elif c == "move" and len(parts) > 2:
-                    make_move(parts[1], int(parts[2]))
-                    print_prompt()
-                elif c == "peers":
-                    print("\n--- Peers ---")
-                    for uid, p in peers.items():
-                        print(f"{uid} ({p['display_name']}) @ {p['ip']}")
-                    print("-------------")
-                    print_prompt()
-                elif c == "group" and len(parts) > 1:
-                    sub = parts[1]
-                    if sub == "create" and len(parts) > 2:
-                        rest = parts[2].split(" ", 1)
-                        gid = rest[0]
-                        mems = rest[1].split(",") if len(rest) > 1 else []
-                        create_group(gid, mems, f"Group {gid}")
-                        print(f"Group {gid} created.")
-                    elif sub == "send" and len(parts) > 2:
-                        rest = parts[2].split(" ", 1)
-                        gid = rest[0]
-                        msg = rest[1] if len(rest) > 1 else ""
-                        send_group_message(gid, msg)
-                        print(f"[togroup {gid}] {msg}")
-                    print_prompt()
-                else:
-                    print("Unknown command. Type 'help'.")
-                    print_prompt()
-
-            # Check for incoming DMs or other messages to display
-            with message_lock:
-                for msg in message_queue:
-                    if msg["type"] == "DM":
-                        to_user = extract_field(msg["raw"], "TO")
-                        if to_user == USER_ID:
-                            sender_id = extract_field(msg["raw"], "FROM")
-                            sender_id = sender_id.split("@")[0] if "@" in str(sender_id) else "unknown"
-                            sender_name = peers.get(sender_id, {}).get("display_name", sender_id)
-                            message = extract_field(msg["raw"], "MESSAGE") or "No message"
-                            clear_input_line()
-                            print(f"[← {sender_name}] {message}")
-                            print_prompt()
-                    elif msg["type"] == "POST":
-                        sender = extract_field(msg["raw"], "FROM")
-                        sender = sender.split("@")[0] if "@" in str(sender) else "someone"
-                        sender_name = peers.get(sender, {}).get("display_name", sender)
-                        message = extract_field(msg["raw"], "MESSAGE") or ""
-                        clear_input_line()
-                        print(f"[POST][{sender_name}] {message}")
-                        print_prompt()
-                # Remove processed messages (optional filtering)
-                message_queue[:] = [m for m in message_queue if m["type"] != "DM" or extract_field(m["raw"], "TO") != USER_ID]
-
-            time.sleep(0.05)  # Smooth loop
-
+            time.sleep(0.01)
     except KeyboardInterrupt:
         pass
     finally:
